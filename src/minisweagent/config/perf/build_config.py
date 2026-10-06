@@ -4,10 +4,12 @@
 Usage: build_config.py OUT.yaml [--guide NAME] [--tools NAME]
   --guide: file in perf/guides/, without .md
   --tools: folder in perf/tools/; put on the agent's PATH and described from its TOOLS.md
+  --tools-dest: copy the tools there and put that copy on PATH, so PATH does not reveal this checkout
 """
 
 import argparse
 import os
+import shutil
 from pathlib import Path
 
 import yaml
@@ -30,7 +32,7 @@ def raw(text: str) -> str:
     return "{% raw %}" + text.strip() + "{% endraw %}\n\n"
 
 
-def build(guide: str | None, tools: str | None = None) -> dict:
+def build(guide: str | None, tools: str | None = None, tools_dest: Path | None = None) -> dict:
     config = yaml.safe_load((CONFIG_DIR / "mini.yaml").read_text())
     template = config["agent"]["instance_template"]
     start = template.index("## Recommended Workflow")
@@ -41,6 +43,9 @@ def build(guide: str | None, tools: str | None = None) -> dict:
     if tools:
         tools_dir = (PERF_DIR / "tools" / tools).resolve()
         middle += "## Tools\n\n" + raw((tools_dir / "TOOLS.md").read_text())
+        if tools_dest:
+            shutil.copytree(tools_dir, tools_dest, ignore=shutil.ignore_patterns("TOOLS.md"), dirs_exist_ok=True)
+            tools_dir = tools_dest.resolve()
         config["environment"]["env"]["PATH"] = f"{tools_dir}:{os.environ['PATH']}"
     config["agent"]["instance_template"] = template[:start] + middle + SUBMIT + template[end:]
     config["agent"]["system_template"] = SYSTEM
@@ -52,8 +57,9 @@ def main():
     parser.add_argument("out", type=Path)
     parser.add_argument("--guide")
     parser.add_argument("--tools")
+    parser.add_argument("--tools-dest", type=Path)
     args = parser.parse_args()
-    args.out.write_text(yaml.safe_dump(build(args.guide, args.tools), sort_keys=False, allow_unicode=True, width=10_000))
+    args.out.write_text(yaml.safe_dump(build(args.guide, args.tools, args.tools_dest), sort_keys=False, allow_unicode=True, width=10_000))
 
 
 if __name__ == "__main__":
