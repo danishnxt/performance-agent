@@ -9,7 +9,7 @@ These rules apply to any codebase. They tell you how to work. A domain guide, if
 3. **Rank the regressions by size and work the worst first.** List the slow workloads by how much slower they are. There may be more than one cause, and a large one can hide a small one. Look at the ones that moved, and at the ones that did not. What do the slow ones do that the fast ones don't?
 4. **Profile the worst workload.** Find the part (function, operator, stage) that takes the most time, or does far more work than it should. If a profiling tool is listed under Tools, use it. After fixing one cause, re-measure and go back to step 3 for the next.
 5. **Find the code responsible.** Name the file and function that decides or does that work.
-6. **State a hypothesis that predicts a number.** For example: "if this is the cause, workload X drops from 500 ms to about 150 ms".
+6. **State a hypothesis that predicts a number, then test it with an experiment.** For example: "if this is the cause, workload X drops from 500 ms to about 150 ms". Make the smallest code change that would show whether it is right, rebuild, and re-run that workload. Do this within about 10 steps of naming the code. Do not try to work out the answer by hand by tracing formulas or simulating the code; the measurement is faster and settles it. If the number does not move as predicted, revert and drop the hypothesis.
 7. **Fix the cause, then re-measure** the slow workloads *and* some unaffected ones. Keep the fix only if the slow ones improve beyond noise and the others do not get worse. Otherwise revert it and go back to step 4.
 8. **Report** what you found, what you changed, and the before/after numbers. Claim only what you measured.
 
