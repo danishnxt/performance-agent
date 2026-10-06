@@ -5,6 +5,7 @@ Usage: build_config.py OUT.yaml [--guide NAME] [--tools NAME]
   --guide: file in perf/guides/, without .md
   --tools: folder in perf/tools/; put on the agent's PATH and described from its TOOLS.md
   --tools-dest: copy the tools there and put that copy on PATH, so PATH does not reveal this checkout
+  --workdir, --scratch: tell the agent where the repository is and where to put scratch files
 """
 
 import argparse
@@ -32,12 +33,23 @@ def raw(text: str) -> str:
     return "{% raw %}" + text.strip() + "{% endraw %}\n\n"
 
 
-def build(guide: str | None, tools: str | None = None, tools_dest: Path | None = None) -> dict:
+def build(
+    guide: str | None,
+    tools: str | None = None,
+    tools_dest: Path | None = None,
+    workdir: Path | None = None,
+    scratch: Path | None = None,
+) -> dict:
     config = yaml.safe_load((CONFIG_DIR / "mini.yaml").read_text())
     template = config["agent"]["instance_template"]
     start = template.index("## Recommended Workflow")
     end = template.index("## Command Execution Rules")
     middle = raw((PERF_DIR / "workflow.md").read_text())
+    if workdir:
+        env = f"The repository is your current working directory, `{workdir}`. Every command starts there; do not search the machine for it."
+        if scratch:
+            env += f" Put scratch files in `{scratch}` (also `$TMPDIR`); `/tmp` is not available."
+        middle = "## Environment\n\n" + raw(env) + middle
     if guide:
         middle += "## Domain guide\n\n" + raw((PERF_DIR / "guides" / f"{guide}.md").read_text())
     if tools:
@@ -58,8 +70,10 @@ def main():
     parser.add_argument("--guide")
     parser.add_argument("--tools")
     parser.add_argument("--tools-dest", type=Path)
+    parser.add_argument("--workdir", type=Path)
+    parser.add_argument("--scratch", type=Path)
     args = parser.parse_args()
-    args.out.write_text(yaml.safe_dump(build(args.guide, args.tools, args.tools_dest), sort_keys=False, allow_unicode=True, width=10_000))
+    args.out.write_text(yaml.safe_dump(build(args.guide, args.tools, args.tools_dest, args.workdir, args.scratch), sort_keys=False, allow_unicode=True, width=10_000))
 
 
 if __name__ == "__main__":
