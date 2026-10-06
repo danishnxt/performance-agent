@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Profile one DuckDB query and print a compact per-operator table.
+
+Usage:
+  perf-profile BENCHMARK_FILE              e.g. perf-profile benchmark/tpch/sf10/q05.benchmark
+  perf-profile QUERY.sql --db DB_FILE
+  perf-profile -c "SELECT ..." --db DB_FILE
+
+Options:
+  --duckdb PATH   DuckDB CLI to use (default: $DUCKDB, then build/release/duckdb, build/reldebug/duckdb, duckdb on PATH)
+  --all           show every operator, not only those with >= 1% of time
+  --json PATH     also keep the raw JSON profile at PATH
+  --from-json P   summarise an existing JSON profile instead of running a query
+
+Runs the query once with DuckDB's JSON profiling and summarises it. Pure Python, works on macOS and Linux.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+BENCH_DATA_DIR = "duckdb_benchmark_data"
+
+
+def die(msg):
+    print(f"perf-profile: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def find_duckdb(explicit):
+    for cand in [explicit, os.environ.get("DUCKDB"), "build/release/duckdb", "build/reldebug/duckdb"]:
+        if cand and Path(cand).is_file():
+            return cand
+    found = shutil.which("duckdb")
+    if found:
+        return found
+    die("no DuckDB CLI found; build one or pass --duckdb PATH")
+
+
+def read_benchmark(path, args=None, root=Path(".")):
+    """Return (sql, cache_db) from a DuckDB .benchmark file, following template/include lines."""
+    args = dict(args or {})
+    sql, cache = None, None
+    lines = Path(path).read_text().splitlines()
+    subst = lambda s: re.sub(r"\$\{(\w+)\}", lambda m: args.get(m.group(1), m.group(0)), s)
+    # KEY=VALUE lines are arguments for the template, so collect them first.
+    for line in lines:
+        m = re.fullmatch(r"\s*(\w+)=(.*)", line)
+        if m:
+            args.setdefault(m.group(1), m.group(2).strip())
+    i = 0
+    while i < len(lines):
+        line = subst(lines[i].strip())
+        word, _, rest = line.partition(" ")
+        if word == "argument":
+            k, _, v = rest.partition(" ")
+            args.setdefault(k, v.strip())
+        elif word in ("template", "include"):
+            s, c = read_benchmark(root / rest.strip(), args, root)
+            sql, cache = sql or s, cache or c
+        elif word == "cache":
+            cache = rest.split()[0]
+        elif word == "run":
+            if rest.strip():
+                sql = (root / rest.strip()).read_text()
+            else:
+                block = []
+                while i + 1 < len(lines) and lines[i + 1].strip():
+                    i += 1
+                    block.append(subst(lines[i]))
+                sql = "\n".join(block)
+        i += 1
+    return sql, cache
+
+
+def walk(node, depth, out, parent=None):
+    node["_depth"], node["_parent"] = depth, parent
+    node["_id"] = len(out)
+    out.append(node)
+    for child in node.get("children", []):
+        walk(child, depth + 1, out, node)
+
+
+def kind(node):
+    return node.get("operator_type") or node.get("type") or "?"
+
+
+def timing(node):
+    return node.get("operator_timing", node.get("timing", 0)) or 0
+
+
+def est(node):
+    v = node.get("extra_info", {}).get("Estimated Cardinality")
+    try:
+        return int(str(v).replace("~", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def rows(node):
+    return node.get("operator_cardinality", node.get("intermediate_rows", node.get("cardinality", 0))) or 0
+
+
+def human(n):
+    if n is None:
+        return "-"
+    for unit, size in (("G", 1e9), ("M", 1e6), ("K", 1e3)):
+        if abs(n) >= size:
+            return f"{n / size:.1f}{unit}"
+    return str(int(n))
+
+
+def short(value, width):
+    text = ", ".join(value) if isinstance(value, list) else str(value)
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[: width - 3] + "..."
+
+
+def detail(node):
+    info = node.get("extra_info", {})
+    for key in ("Table", "Conditions", "Join Type", "Groups", "Aggregates", "Expression", "Order By", "Function"):
+        if key in info:
+            text = short(info[key], 48)
+            if key == "Table":
+                filt = info.get("Filters") or info.get("Dynamic Filters")
+                text += f" [filter: {short(filt, 30)}]" if filt else ""
+            return text
+    return ""
+
+
+def main():
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("target", nargs="?")
+    p.add_argument("-c", dest="sql")
+    p.add_argument("--db")
+    p.add_argument("--duckdb")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--json")
+    p.add_argument("--from-json")
+    p.add_argument("-h", "--help", action="store_true")
+    a = p.parse_args()
+    if a.from_json:
+        summarise(json.loads(Path(a.from_json).read_text()), a.from_json, "-", "-", a.all)
+        return
+    if a.help or not (a.target or a.sql):
+        print(__doc__)
+        sys.exit(0 if a.help else 2)
+
+    label = a.target or "-c"
+    if a.sql:
+        sql = a.sql
+    elif a.target.endswith(".benchmark"):
+        sql, cache = read_benchmark(a.target)
+        if not sql:
+            die(f"no 'run' query found in {a.target}")
+        if not a.db and cache:
+            a.db = str(Path(BENCH_DATA_DIR) / cache)
+            if not Path(a.db).is_file():
+                die(f"{a.db} not found; run this benchmark once with benchmark_runner to create it, or pass --db")
+    else:
+        sql = Path(a.target).read_text()
+    if not a.db:
+        die("no database: pass --db DB_FILE (a .benchmark file supplies its own)")
+    if not Path(a.db).is_file():
+        die(f"database not found: {a.db}")
+
+    duckdb = find_duckdb(a.duckdb)
+    tmp = tempfile.mkdtemp(prefix="perf-profile-")
+    prof = a.json or os.path.join(tmp, "profile.json")
+    sqlfile = os.path.join(tmp, "query.sql")
+    Path(sqlfile).write_text(sql)
+    setup = f"PRAGMA enable_profiling='json'; PRAGMA profiling_mode='detailed'; PRAGMA profiling_output='{prof}';"
+    proc = subprocess.run(
+        [duckdb, "-readonly", a.db, "-c", setup, "-c", f".read {sqlfile}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0 or not Path(prof).is_file():
+        die(f"query failed (exit {proc.returncode}): {proc.stderr.strip()[:500]}")
+    summarise(json.loads(Path(prof).read_text()), label, duckdb, a.db, a.all)
+
+
+def summarise(data, label, duckdb, db, show_all):
+    roots = data.get("operator") or data.get("children") or []
+    roots = roots if isinstance(roots, list) else [roots]
+    ops = []
+    for r in roots:
+        walk(r, 0, ops)
+    total = sum(timing(o) for o in ops) or 1e-12
+    q = data.get("query", {})
+    wall = data.get("latency") or q.get("latency") or q.get("total_time")
+    cpu = data.get("cpu_time") or q.get("cpu_time")
+    mem = data.get("system_peak_buffer_memory") or data.get("system", {}).get("peak_buffer_memory")
+
+    print(f"perf-profile {label}")
+    print(f"  duckdb {duckdb}   db {db}")
+    head = [f"wall {wall:.3f}s" if wall else None, f"cpu {cpu:.3f}s" if cpu else None, f"peak mem {human(mem)}B" if mem else None]
+    print("  " + "   ".join(h for h in head if h))
+    print("  One run, not a benchmark. Operator time = CPU summed over threads. est/act = estimated / actual rows.")
+    print()
+
+    print(f"{'id':>3}  {'operator':<28} {'time%':>6} {'cpu_s':>8} {'rows_out':>9} {'est_rows':>9} {'est/act':>8}  detail")
+    hidden = 0
+    for o in ops:
+        t = timing(o)
+        share = 100 * t / total
+        is_key = "JOIN" in kind(o) or kind(o) == "TABLE_SCAN"
+        if not show_all and share < 1 and not is_key:
+            hidden += 1
+            continue
+        e, r = est(o), rows(o)
+        ratio = f"{e / r:.2g}x" if e is not None and r else "-"
+        name = ("." * min(o["_depth"], 12) + kind(o))[:28]
+        print(f"{o['_id']:>3}  {name:<28} {share:>5.1f}% {t:>8.3f} {human(r):>9} {human(e):>9} {ratio:>8}  {detail(o)}")
+    if hidden:
+        print(f"  ({hidden} operators under 1% hidden; --all shows them)")
+
+    joins = [o for o in ops if "JOIN" in kind(o) and len(o.get("children", [])) == 2]
+    if joins:
+        print()
+        print("Joins: probe = left child, build = right child (the hash table is built from the build side).")
+        print(f"{'id':>3}  {'type':<22} {'probe_rows':>10} {'build_rows':>10} {'out_rows':>9}  flags")
+        for o in joins:
+            probe, build = (rows(c) for c in o["children"])
+            flags = []
+            if "HASH" in kind(o) and build > probe and build > 1000:
+                flags.append(f"BUILD>PROBE ({build / max(probe, 1):.1f}x)")
+            e = est(o)
+            if e and rows(o) and max(e / rows(o), rows(o) / e) >= 10:
+                flags.append("estimate off >=10x")
+            print(f"{o['_id']:>3}  {kind(o):<22} {human(probe):>10} {human(build):>10} {human(rows(o)):>9}  {' '.join(flags)}")
+
+    off = [o for o in ops if est(o) and rows(o) and max(est(o) / rows(o), rows(o) / est(o)) >= 10 and "JOIN" not in kind(o)]
+    if off:
+        print()
+        print("Other operators whose row estimate is off by >=10x: " + ", ".join(f"{o['_id']} {kind(o)}" for o in off[:12]))
+
+
+if __name__ == "__main__":
+    main()

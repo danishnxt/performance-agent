@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Build a performance-agent config: mini.yaml with the SWE workflow replaced by perf/workflow.md.
 
-Usage: build_config.py OUT.yaml [--guide NAME]   (NAME = file in perf/guides/, without .md)
+Usage: build_config.py OUT.yaml [--guide NAME] [--tools NAME]
+  --guide: file in perf/guides/, without .md
+  --tools: folder in perf/tools/; put on the agent's PATH and described from its TOOLS.md
 """
 
 import argparse
+import os
 from pathlib import Path
 
 import yaml
@@ -27,7 +30,7 @@ def raw(text: str) -> str:
     return "{% raw %}" + text.strip() + "{% endraw %}\n\n"
 
 
-def build(guide: str | None) -> dict:
+def build(guide: str | None, tools: str | None = None) -> dict:
     config = yaml.safe_load((CONFIG_DIR / "mini.yaml").read_text())
     template = config["agent"]["instance_template"]
     start = template.index("## Recommended Workflow")
@@ -35,6 +38,10 @@ def build(guide: str | None) -> dict:
     middle = raw((PERF_DIR / "workflow.md").read_text())
     if guide:
         middle += "## Domain guide\n\n" + raw((PERF_DIR / "guides" / f"{guide}.md").read_text())
+    if tools:
+        tools_dir = (PERF_DIR / "tools" / tools).resolve()
+        middle += "## Tools\n\n" + raw((tools_dir / "TOOLS.md").read_text())
+        config["environment"]["env"]["PATH"] = f"{tools_dir}:{os.environ['PATH']}"
     config["agent"]["instance_template"] = template[:start] + middle + SUBMIT + template[end:]
     config["agent"]["system_template"] = SYSTEM
     return config
@@ -44,8 +51,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("out", type=Path)
     parser.add_argument("--guide")
+    parser.add_argument("--tools")
     args = parser.parse_args()
-    args.out.write_text(yaml.safe_dump(build(args.guide), sort_keys=False, allow_unicode=True, width=10_000))
+    args.out.write_text(yaml.safe_dump(build(args.guide, args.tools), sort_keys=False, allow_unicode=True, width=10_000))
 
 
 if __name__ == "__main__":

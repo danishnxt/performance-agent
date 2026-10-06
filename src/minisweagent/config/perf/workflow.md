@@ -6,8 +6,8 @@ These rules apply to any codebase. They tell you how to work. A domain guide, if
 
 1. **Measure.** Run the workloads you were given. Record the time for each one.
 2. **Decide whether it is real** (see "Code or environment?" below). Do not blame the machine until you have ruled out the code.
-3. **Find what the slow workloads share.** Look at the ones that moved, and at the ones that did not. What do the slow ones do that the fast ones don't?
-4. **Profile one slow workload.** Find the part (function, operator, stage) that takes the most time, or does far more work than it should.
+3. **Rank the regressions by size and work the worst first.** List the slow workloads by how much slower they are. There may be more than one cause, and a large one can hide a small one. Look at the ones that moved, and at the ones that did not. What do the slow ones do that the fast ones don't?
+4. **Profile the worst workload.** Find the part (function, operator, stage) that takes the most time, or does far more work than it should. If a profiling tool is listed under Tools, use it. After fixing one cause, re-measure and go back to step 3 for the next.
 5. **Find the code responsible.** Name the file and function that decides or does that work.
 6. **State a hypothesis that predicts a number.** For example: "if this is the cause, workload X drops from 500 ms to about 150 ms".
 7. **Fix the cause, then re-measure** the slow workloads *and* some unaffected ones. Keep the fix only if the slow ones improve beyond noise and the others do not get worse. Otherwise revert it and go back to step 4.
