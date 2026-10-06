@@ -48,7 +48,7 @@ def build(
     if workdir:
         env = f"The repository is your current working directory, `{workdir}`. Every command starts there; do not search the machine for it."
         if scratch:
-            env += f" Put scratch files in `{scratch}` (also `$TMPDIR`); `/tmp` is not available."
+            env += f" Put scratch files in `{scratch}` (also `$TMPDIR`); `/tmp` is not available. There is no network access."
         middle = "## Environment\n\n" + raw(env) + middle
     if guide:
         middle += "## Domain guide\n\n" + raw((PERF_DIR / "guides" / f"{guide}.md").read_text())
