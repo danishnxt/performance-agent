@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""CPU profile of one DuckDB query while it runs: which functions the CPU time goes to.
+
+Usage:
+  perf-sample BENCHMARK_FILE              e.g. perf-sample benchmark/tpch/sf10/q19.benchmark
+  perf-sample QUERY.sql --db DB_FILE
+  perf-sample -c "SELECT ..." --db DB_FILE
+  perf-sample --pid PID                   profile a process that is already running
+
+Options:
+  --seconds N     how long to sample (default 5)
+  --top N         rows per table (default 25)
+  --duckdb PATH   DuckDB CLI to use (default: $DUCKDB, then build/release/duckdb, build/reldebug/duckdb)
+  --raw PATH      also keep the profiler's raw output at PATH
+
+It starts the DuckDB CLI, runs the query once to warm up, then runs it over and over while the profiler
+samples the process. Loading the database and the warm-up run are not in the profile. Idle threads and time
+spent waiting are dropped. Uses macOS `sample` or Linux `perf`; no sudo needed on macOS.
+"""
+
+import argparse
+import importlib.machinery
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+profile_tool = importlib.machinery.SourceFileLoader("perf_profile", str(Path(__file__).with_name("perf-profile"))).load_module()
+
+# Leaf frames that mean the thread was waiting, not computing.
+IDLE = re.compile(
+    r"^(__psynch_cvwait|__psynch_mutexwait|__workq_kernreturn|__semwait_signal|semaphore_\w*wait\w*|mach_msg\w*|"
+    r"__ulock_wait\w*|kevent\w*|__select|poll|__read_nocancel|read|nanosleep|__sleep|swtch_pri|thread_switch|"
+    r"futex_wait\w*|do_futex|epoll_wait|__futex_abstimed_wait\w*|syscall|pthread_cond_\w*wait|start_wqthread)$"
+)
+# Entry frames that every busy thread runs through; hidden from the inclusive table when they hold nearly everything.
+ENTRY_SHARE = 0.95
+
+
+def die(msg):
+    print(f"perf-sample: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def short_name(name, width=96):
+    """Collapse template arguments and trim, so C++ names fit on a line."""
+    out, depth = [], 0
+    for ch in name:
+        if ch == "<":
+            if depth == 0:
+                out.append("<…>")
+            depth += 1
+        elif ch == ">" and depth:
+            depth -= 1
+        elif depth == 0:
+            out.append(ch)
+    text = "".join(out)
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+# ---- macOS: sample --------------------------------------------------------------------------------------------
+
+MAC_LINE = re.compile(r"^(?P<prefix>[\s+!:|]*)(?P<count>\d+) (?P<rest>.*)$")
+MAC_FRAME = re.compile(r"^(?P<sym>.*?)\s+\(in (?P<lib>[^)]+)\)(?:\s+\+ [\d,.]+)?(?:\s+\[[^\]]*\])?(?:\s+(?P<src>\S+:[\d,.]+))?\s*$")
+
+
+def parse_mac(text):
+    """Turn `sample`'s call graph into (thread, stack root->leaf, self samples)."""
+    lines = text.split("Call graph:", 1)[-1].split("\n\n")[0].splitlines()
+    nodes, path, thread = [], [], None  # nodes: [thread, stack, count, children's count]; path: (indent, node index)
+    for line in lines:
+        m = MAC_LINE.match(line)
+        if not m:
+            continue
+        indent, count, rest = len(m["prefix"]), int(m["count"]), m["rest"]
+        if rest.startswith("Thread_"):
+            thread, path = rest.split()[0], []
+            continue
+        f = MAC_FRAME.match(rest)
+        frame = (f["sym"].strip(), f["lib"], f["src"]) if f else (rest.strip(), "?", None)
+        while path and path[-1][0] >= indent:
+            path.pop()
+        stack = (nodes[path[-1][1]][1] if path else []) + [frame]
+        if path:
+            nodes[path[-1][1]][3] += count
+        path.append((indent, len(nodes)))
+        nodes.append([thread, stack, count, 0])
+    # A node's own samples are its count minus its children's.
+    return [(t, stack, count - below) for t, stack, count, below in nodes if count > below]
+
+
+def run_mac(pid, seconds, raw):
+    if not shutil.which("sample"):
+        die("macOS `sample` not found")
+    proc = subprocess.run(["sample", str(pid), str(seconds), "1", "-mayDie", "-file", raw], capture_output=True, text=True)
+    if not Path(raw).is_file():
+        die(f"sample failed: {proc.stderr.strip()[:300] or proc.stdout.strip()[:300]}")
+    return parse_mac(Path(raw).read_text(errors="replace")), "macOS sample, 1 ms per thread"
+
+
+# ---- Linux: perf ----------------------------------------------------------------------------------------------
+
+LINUX_FRAME = re.compile(r"^\s*[0-9a-f]+\s+(?P<sym>.+?)(?:\+0x[0-9a-f]+)?\s+\((?P<lib>[^)]*)\)\s*$")
+
+
+def parse_linux(text):
+    out = []
+    for block in text.split("\n\n"):
+        lines = [l for l in block.splitlines() if l.strip()]
+        if not lines:
+            continue
+        head = lines[0].split()
+        thread = head[1] if len(head) > 1 else "?"
+        frames = []
+        for line in lines[1:]:
+            m = LINUX_FRAME.match(line)
+            if m:
+                frames.append((m["sym"], Path(m["lib"]).name, None))
+        if frames:
+            out.append((thread, frames[::-1], 1))
+    return out
+
+
+def run_linux(pid, seconds, raw):
+    if not shutil.which("perf"):
+        die("`perf` not found; install linux-tools for this kernel")
+    data = raw + ".data"
+    rec = subprocess.run(["perf", "record", "-F", "999", "-g", "-p", str(pid), "-o", data, "--", "sleep", str(seconds)], capture_output=True, text=True)
+    if rec.returncode != 0 or not Path(data).is_file():
+        die(f"perf record failed (check /proc/sys/kernel/perf_event_paranoid): {rec.stderr.strip()[:300]}")
+    script = subprocess.run(["perf", "script", "-i", data, "-F", "comm,tid,ip,sym,dso"], capture_output=True, text=True)
+    Path(raw).write_text(script.stdout)
+    return parse_linux(script.stdout), "Linux perf record, 999 Hz per thread"
+
+
+# ---- running the query ----------------------------------------------------------------------------------------
+
+
+class QueryLoop:
+    """The DuckDB CLI, fed the query over and over through stdin; counts finished runs."""
+
+    MARK = "perf-sample-done"
+
+    def __init__(self, duckdb, db, sql):
+        self.sql = sql.strip().rstrip(";") + ";\n.print " + self.MARK + "\n"
+        self.proc = subprocess.Popen(
+            [duckdb, "-readonly", db], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        )
+        self.runs, self.stop, self.errors = 0, threading.Event(), []
+
+    def warm_up(self):
+        start = time.time()
+        self.proc.stdin.write(".mode trash\n" + self.sql)
+        self.proc.stdin.flush()
+        for line in self.proc.stdout:
+            if line.strip() == self.MARK:
+                break
+            self.errors.append(line.rstrip())
+        else:
+            die("query failed: " + " ".join(self.errors)[:500])
+        if self.errors:
+            die("query failed: " + " ".join(self.errors)[:500])
+        threading.Thread(target=self._feed, daemon=True).start()
+        threading.Thread(target=self._count, daemon=True).start()
+        return time.time() - start
+
+    def _feed(self):
+        try:
+            while not self.stop.is_set():
+                self.proc.stdin.write(self.sql)
+                self.proc.stdin.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            pass
+
+    def _count(self):
+        for line in self.proc.stdout:
+            if line.strip() == self.MARK:
+                self.runs += 1
+            elif line.strip():
+                self.errors.append(line.rstrip())
+
+    def close(self):
+        self.stop.set()
+        self.proc.kill()
+        self.proc.wait()
+
+
+# ---- report ---------------------------------------------------------------------------------------------------
+
+
+def report(stacks, top):
+    busy_by_thread, idle_threads = Counter(), set()
+    own, incl, files, libs = Counter(), Counter(), defaultdict(Counter), {}
+    for thread, stack, count in stacks:
+        stack = [(short_name(s, 10**6), l, f) for s, l, f in stack]
+        sym = stack[-1][0]
+        if IDLE.match(sym):
+            idle_threads.add(thread)
+            continue
+        busy_by_thread[thread] += count
+        own[sym] += count
+        for s, l, f in stack:
+            libs.setdefault(s, l)
+            if f:
+                files[s][f.rsplit(":", 1)[0]] += count
+        for s in {s for s, _, _ in stack}:
+            incl[s] += count
+    total = sum(busy_by_thread.values())
+    if not total:
+        die("no busy CPU samples; the query may have finished before sampling started (try a longer --seconds)")
+    dropped = len(idle_threads - set(busy_by_thread))
+
+    def where(sym):
+        f = files[sym].most_common(1)
+        lib = libs.get(sym, "?")
+        return f[0][0] if f else ("" if lib == "duckdb" else f"({lib})")
+
+    print(f"  {total:,} busy samples across {len(busy_by_thread)} threads ({dropped} idle threads dropped).")
+    print("  self = CPU in the function's own code; incl = own code plus everything it calls. % of busy samples.")
+    print()
+    print("By self time:")
+    print(f"{'self%':>6} {'incl%':>6}  {'function':<96}  file")
+    for sym, n in own.most_common(top):
+        print(f"{100 * n / total:>5.1f}% {100 * incl[sym] / total:>5.1f}%  {short_name(sym):<96}  {where(sym)}")
+    print()
+    print("By inclusive time:")
+    print(f"{'incl%':>6} {'self%':>6}  {'function':<96}  file")
+    hidden, shown = 0, 0
+    for sym, n in incl.most_common():
+        if n / total >= ENTRY_SHARE or libs.get(sym, "duckdb") != "duckdb" and own[sym] / total < 0.01:
+            hidden += 1
+            continue
+        print(f"{100 * n / total:>5.1f}% {100 * own[sym] / total:>5.1f}%  {short_name(sym):<96}  {where(sym)}")
+        shown += 1
+        if shown >= top:
+            break
+    if hidden:
+        print(f"  (thread entry frames above {ENTRY_SHARE:.0%} and system-library frames hidden)")
+
+
+def main():
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("target", nargs="?")
+    p.add_argument("-c", dest="sql")
+    p.add_argument("--db")
+    p.add_argument("--pid", type=int)
+    p.add_argument("--duckdb")
+    p.add_argument("--seconds", type=float, default=5)
+    p.add_argument("--top", type=int, default=25)
+    p.add_argument("--raw")
+    p.add_argument("-h", "--help", action="store_true")
+    a = p.parse_args()
+    if a.help or not (a.target or a.sql or a.pid):
+        print(__doc__)
+        sys.exit(0 if a.help else 2)
+
+    system = platform.system()
+    if system not in ("Darwin", "Linux"):
+        die(f"unsupported platform {system}")
+    run = run_mac if system == "Darwin" else run_linux
+    raw = a.raw or os.path.join(tempfile.mkdtemp(prefix="perf-sample-"), "raw.txt")
+    seconds = max(1, round(a.seconds))
+
+    if a.pid:
+        print(f"perf-sample --pid {a.pid}")
+        stacks, how = run(a.pid, seconds, raw)
+        print(f"  profiler: {how}; sampled {seconds} s of a running process")
+        report(stacks, a.top)
+        return
+
+    label = a.target or "-c"
+    if a.sql:
+        sql = a.sql
+    elif a.target.endswith(".benchmark"):
+        sql, cache = profile_tool.read_benchmark(a.target)
+        if not sql:
+            die(f"no 'run' query found in {a.target}")
+        if not a.db and cache:
+            a.db = str(Path(profile_tool.BENCH_DATA_DIR) / cache)
+    else:
+        sql = Path(a.target).read_text()
+    if not a.db:
+        die("no database: pass --db DB_FILE (a .benchmark file supplies its own)")
+    if not Path(a.db).is_file():
+        die(f"database not found: {a.db}")
+    duckdb = profile_tool.find_duckdb(a.duckdb)
+
+    loop = QueryLoop(duckdb, a.db, sql)
+    try:
+        warm = loop.warm_up()
+        before = loop.runs
+        stacks, how = run(loop.proc.pid, seconds, raw)
+        runs = loop.runs - before
+    finally:
+        loop.close()
+    print(f"perf-sample {label}")
+    print(f"  duckdb {duckdb}   db {a.db}")
+    print(f"  profiler: {how}")
+    each = f", about {1000 * seconds / runs:.0f} ms each" if runs else "; no run finished inside the window"
+    print(f"  warm-up run {warm:.3f} s (not profiled), then {seconds} s sampled while the query ran {runs} times{each}")
+    report(stacks, a.top)
+
+
+if __name__ == "__main__":
+    main()

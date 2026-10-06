@@ -4,12 +4,14 @@
 Usage: build_config.py OUT.yaml [--guide NAME] [--tools NAME]
   --guide: file in perf/guides/, without .md
   --tools: folder in perf/tools/; put on the agent's PATH and described from its TOOLS.md
+  Adds guides/platform/<os>.md for the OS it runs on.
   --tools-dest: copy the tools there and put that copy on PATH, so PATH does not reveal this checkout
   --workdir, --scratch: tell the agent where the repository is and where to put scratch files
 """
 
 import argparse
 import os
+import platform
 import shutil
 from pathlib import Path
 
@@ -50,6 +52,9 @@ def build(
         if scratch:
             env += f" Put scratch files in `{scratch}` (also `$TMPDIR`); `/tmp` is not available. There is no network access."
         middle = "## Environment\n\n" + raw(env) + middle
+    os_guide = PERF_DIR / "guides" / "platform" / f"{platform.system().lower()}.md"
+    if os_guide.is_file():
+        middle += "## Platform\n\n" + raw(os_guide.read_text())
     if guide:
         middle += "## Domain guide\n\n" + raw((PERF_DIR / "guides" / f"{guide}.md").read_text())
     if tools:

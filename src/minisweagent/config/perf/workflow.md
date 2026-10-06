@@ -9,7 +9,7 @@ These rules apply to any codebase. They tell you how to work. A domain guide, if
 3. **Rank the regressions by size and work the worst first.** List the slow workloads by how much slower they are. There may be more than one cause, and a large one can hide a small one. Look at the ones that moved, and at the ones that did not. What do the slow ones do that the fast ones don't?
 4. **Profile the worst workload.** Find the part (function, operator, stage) that takes the most time, or does far more work than it should. If a profiling tool is listed under Tools, use it. After fixing one cause, re-measure and go back to step 3 for the next.
 5. **Find the code responsible.** Name the file and function that decides or does that work.
-6. **State a hypothesis that predicts a number, then test it with an experiment.** For example: "if this is the cause, workload X drops from 500 ms to about 150 ms". Make the smallest code change that would show whether it is right, rebuild, and re-run that workload. Do this within about 10 steps of naming the code. Do not try to work out the answer by hand by tracing formulas or simulating the code; the measurement is faster and settles it. If the number does not move as predicted, revert and drop the hypothesis.
+6. **State a hypothesis that predicts a number, then test it with an experiment.** For example: "if this is the cause, workload X drops from 500 ms to about 150 ms". Make the smallest code change that would show whether it is right, rebuild, and re-run that workload. Do this within about 10 steps of naming the code. Do not try to work out the answer by hand by tracing formulas or simulating the code; the measurement is faster and settles it. If the number does not move as predicted, revert and drop the hypothesis. A hypothesis that no measurement has confirmed after about 15 steps is dropped too: go back to the profile.
 7. **Fix the cause, then re-measure** the slow workloads *and* some unaffected ones. Keep the fix only if the slow ones improve beyond noise and the others do not get worse. Otherwise revert it and go back to step 4.
 8. **Report** what you found, what you changed, and the before/after numbers. Claim only what you measured.
 
@@ -53,5 +53,5 @@ The absence of history is not evidence that there is no regression. Read the cod
 
 - Reduce the problem to the smallest input that still shows the slowdown.
 - If the system has switches for its optimizations or stages, turn them off one at a time to see which one changes the behaviour.
-- Use a CPU profiler (e.g. `perf`) when the high-level profile looks normal but something is still slow.
+- Use a CPU profiler when the high-level profile looks normal but something is still slow. A slow loop inside one stage shows up only in a CPU profile, as the functions that take the time.
 - After a fix, re-run the full set of workloads, not only the one you fixed, to check you did not just move the cost.
