@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Compare two DuckDB benchmark_runner builds, query by query, against the noise floor.
+
+Usage:
+  perf-compare A B                        e.g. perf-compare $TMPDIR/runner_before build/reldebug/benchmark/benchmark_runner
+  perf-compare A B "benchmark/tpch/sf10/q0[69].benchmark"
+
+Options:
+  --rounds N      rounds of both binaries (default 5); the first round is a warm-up and is dropped
+  --runs N        timed runs per binary per round (default 3)
+
+It runs A and B alternately, swapping which goes first each round (A B, B A, ...), over the benchmarks matching the pattern (default: all of
+benchmark/tpch/sf10), so machine drift hits both alike. For each query it prints the median time of A and B
+and a verdict: faster or slower only if the change is beyond the noise floor (8% per query, 3% for the suite
+total), otherwise "no change beyond noise". Run it from the repository root.
+"""
+
+import argparse
+import statistics
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+QUERY_NOISE = 0.08
+SUITE_NOISE = 0.03
+DEFAULT_PATTERN = "benchmark/tpch/sf10/.*"
+
+
+def die(msg):
+    print(f"perf-compare: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run_once(binary, pattern, runs):
+    """Return {benchmark: [seconds, ...]} from one benchmark_runner invocation."""
+    proc = subprocess.run(
+        [binary, "--timed-runs", str(runs), "--disable-timeout", pattern], capture_output=True, text=True
+    )
+    times = defaultdict(list)
+    # benchmark_runner writes its results table to stderr.
+    for line in (proc.stdout + proc.stderr).splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0] != "name":
+            try:
+                times[parts[0]].append(float(parts[2]))
+            except ValueError:
+                pass  # a failed run prints a message instead of a time
+    if proc.returncode != 0 or not times:
+        die(f"{binary} failed (exit {proc.returncode}): {(proc.stdout + proc.stderr).strip()[-500:]}")
+    return times
+
+
+def verdict(a, b, noise):
+    change = (b - a) / a
+    if change <= -noise:
+        return change, "faster"
+    if change >= noise:
+        return change, "SLOWER"
+    return change, "no change beyond noise"
+
+
+def main():
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("a", nargs="?")
+    p.add_argument("b", nargs="?")
+    p.add_argument("pattern", nargs="?", default=DEFAULT_PATTERN)
+    p.add_argument("--rounds", type=int, default=5)
+    p.add_argument("--runs", type=int, default=3)
+    p.add_argument("-h", "--help", action="store_true")
+    a = p.parse_args()
+    if a.help or not (a.a and a.b):
+        print(__doc__)
+        sys.exit(0 if a.help else 2)
+    for binary in (a.a, a.b):
+        if not Path(binary).is_file():
+            die(f"not found: {binary}")
+    if Path(a.a).resolve() == Path(a.b).resolve():
+        print("perf-compare: A and B are the same file; this measures noise only.", file=sys.stderr)
+    rounds = max(2, a.rounds)
+
+    times = {"A": defaultdict(list), "B": defaultdict(list)}
+    for r in range(rounds):
+        # Whichever runs second in a round runs a little slower, so swap the order every round.
+        order = (("A", a.a), ("B", a.b))
+        for name, binary in order if r % 2 == 0 else order[::-1]:
+            got = run_once(binary, a.pattern, a.runs)
+            if r == 0:
+                continue  # warm-up round
+            for bench, ts in got.items():
+                times[name][bench].extend(ts)
+
+    benches = sorted(set(times["A"]) & set(times["B"]))
+    missing = sorted(set(times["A"]) ^ set(times["B"]))
+    if not benches:
+        die("no benchmark ran in both A and B")
+
+    print(f"perf-compare  A = {a.a}")
+    print(f"              B = {a.b}")
+    print(f"  pattern {a.pattern}; {rounds - 1} rounds of A and B (order swapped each round) after one warm-up round, {a.runs} runs each.")
+    print(f"  Medians in ms. change = (B - A) / A. Noise floor: {QUERY_NOISE:.0%} per query, {SUITE_NOISE:.0%} suite.")
+    print()
+    print(f"{'benchmark':<40} {'A ms':>9} {'B ms':>9} {'change':>8}  verdict")
+    total_a = total_b = 0.0
+    for bench in benches:
+        ma, mb = statistics.median(times["A"][bench]), statistics.median(times["B"][bench])
+        total_a, total_b = total_a + ma, total_b + mb
+        change, word = verdict(ma, mb, QUERY_NOISE)
+        print(f"{bench:<40} {1000 * ma:>9.1f} {1000 * mb:>9.1f} {change:>+7.1%}  {word}")
+    change, word = verdict(total_a, total_b, SUITE_NOISE)
+    print(f"{'suite total (sum of medians)':<40} {1000 * total_a:>9.1f} {1000 * total_b:>9.1f} {change:>+7.1%}  {word}")
+    if missing:
+        print(f"  ran in only one of A and B (failed or not matched): {', '.join(missing)}")
+
+
+if __name__ == "__main__":
+    main()

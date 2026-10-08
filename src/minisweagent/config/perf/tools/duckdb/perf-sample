@@ -6,6 +6,8 @@ Usage:
   perf-sample QUERY.sql --db DB_FILE
   perf-sample -c "SELECT ..." --db DB_FILE
   perf-sample --pid PID                   profile a process that is already running
+  perf-sample --compare A B               profile two queries (as above, same --db) and list the functions
+                                          whose share of CPU time differs most between them
 
 Options:
   --seconds N     how long to sample (default 5)
@@ -16,6 +18,9 @@ Options:
 It starts the DuckDB CLI, runs the query once to warm up, then runs it over and over while the profiler
 samples the process. Loading the database and the warm-up run are not in the profile. Idle threads and time
 spent waiting are dropped. Uses macOS `sample` or Linux `perf`; no sudo needed on macOS.
+
+--compare is for a slow query and a similar fast one: the functions the slow one spends more of its time in
+point at what makes it slow.
 """
 
 import argparse
@@ -195,7 +200,8 @@ class QueryLoop:
 # ---- report ---------------------------------------------------------------------------------------------------
 
 
-def report(stacks, top):
+def tally(stacks):
+    """Busy samples per function (self and inclusive), with where each function lives."""
     busy_by_thread, idle_threads = Counter(), set()
     own, incl, files, libs = Counter(), Counter(), defaultdict(Counter), {}
     for thread, stack, count in stacks:
@@ -222,7 +228,12 @@ def report(stacks, top):
         lib = libs.get(sym, "?")
         return f[0][0] if f else ("" if lib == "duckdb" else f"({lib})")
 
-    print(f"  {total:,} busy samples across {len(busy_by_thread)} threads ({dropped} idle threads dropped).")
+    return own, incl, total, len(busy_by_thread), dropped, where, libs
+
+
+def report(stacks, top):
+    own, incl, total, threads, dropped, where, libs = tally(stacks)
+    print(f"  {total:,} busy samples across {threads} threads ({dropped} idle threads dropped).")
     print("  self = CPU in the function's own code; incl = own code plus everything it calls. % of busy samples.")
     print()
     print("By self time:")
@@ -245,6 +256,55 @@ def report(stacks, top):
         print(f"  (thread entry frames above {ENTRY_SHARE:.0%} and system-library frames hidden)")
 
 
+def compare(a, b, top):
+    """Functions whose share of busy CPU time differs most between profile a and profile b."""
+    (own_a, incl_a, total_a, *_ , where_a, _), (own_b, incl_b, total_b, *_, where_b, _) = tally(a[1]), tally(b[1])
+    pct = lambda c, t, s: 100 * c[s] / t
+    rows = []
+    for sym in set(own_a) | set(own_b):
+        sa, sb = pct(own_a, total_a, sym), pct(own_b, total_b, sym)
+        ia, ib = pct(incl_a, total_a, sym), pct(incl_b, total_b, sym)
+        rows.append((sb - sa, sa, sb, ia, ib, sym))
+    print(f"  A = {a[0]}   B = {b[0]}")
+    print(f"  {total_a:,} busy samples in A, {total_b:,} in B. % of each query's own busy samples; diff = B - A.")
+    print("  A function B spends much more of its time in is where to look if B is the slow one.")
+    print()
+    print(f"{'diff':>6} {'A self':>7} {'B self':>7} {'A incl':>7} {'B incl':>7}  {'function':<96}  file")
+    for d, sa, sb, ia, ib, sym in sorted(rows, key=lambda r: -abs(r[0]))[:top]:
+        print(f"{d:>+5.1f}% {sa:>6.1f}% {sb:>6.1f}% {ia:>6.1f}% {ib:>6.1f}%  {short_name(sym):<96}  {where_b(sym) or where_a(sym)}")
+
+
+def resolve(target, sql, db):
+    """Return (label, sql, db) for a benchmark file, a SQL file or inline SQL."""
+    if sql:
+        return "-c", sql, db
+    if target.endswith(".benchmark"):
+        sql, cache = profile_tool.read_benchmark(target)
+        if not sql:
+            die(f"no 'run' query found in {target}")
+        if not db and cache:
+            db = str(Path(profile_tool.BENCH_DATA_DIR) / cache)
+    else:
+        sql = Path(target).read_text()
+    if not db:
+        die("no database: pass --db DB_FILE (a .benchmark file supplies its own)")
+    if not Path(db).is_file():
+        die(f"database not found: {db}")
+    return target, sql, db
+
+
+def sample_query(duckdb, db, sql, run, seconds, raw):
+    loop = QueryLoop(duckdb, db, sql)
+    try:
+        warm = loop.warm_up()
+        before = loop.runs
+        stacks, how = run(loop.proc.pid, seconds, raw)
+        runs = loop.runs - before
+    finally:
+        loop.close()
+    return stacks, how, warm, runs
+
+
 def main():
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("target", nargs="?")
@@ -255,9 +315,10 @@ def main():
     p.add_argument("--seconds", type=float, default=5)
     p.add_argument("--top", type=int, default=25)
     p.add_argument("--raw")
+    p.add_argument("--compare", nargs=2)
     p.add_argument("-h", "--help", action="store_true")
     a = p.parse_args()
-    if a.help or not (a.target or a.sql or a.pid):
+    if a.help or not (a.target or a.sql or a.pid or a.compare):
         print(__doc__)
         sys.exit(0 if a.help else 2)
 
@@ -275,33 +336,23 @@ def main():
         report(stacks, a.top)
         return
 
-    label = a.target or "-c"
-    if a.sql:
-        sql = a.sql
-    elif a.target.endswith(".benchmark"):
-        sql, cache = profile_tool.read_benchmark(a.target)
-        if not sql:
-            die(f"no 'run' query found in {a.target}")
-        if not a.db and cache:
-            a.db = str(Path(profile_tool.BENCH_DATA_DIR) / cache)
-    else:
-        sql = Path(a.target).read_text()
-    if not a.db:
-        die("no database: pass --db DB_FILE (a .benchmark file supplies its own)")
-    if not Path(a.db).is_file():
-        die(f"database not found: {a.db}")
     duckdb = profile_tool.find_duckdb(a.duckdb)
+    if a.compare:
+        profiles = []
+        for i, target in enumerate(a.compare):
+            label, sql, db = resolve(target, None, a.db)
+            stacks, how, warm, runs = sample_query(duckdb, db, sql, run, seconds, f"{raw}.{'AB'[i]}")
+            profiles.append((label, stacks))
+        print(f"perf-sample --compare {a.compare[0]} {a.compare[1]}")
+        print(f"  duckdb {duckdb}")
+        print(f"  profiler: {how}; {seconds} s sampled per query")
+        compare(*profiles, a.top)
+        return
 
-    loop = QueryLoop(duckdb, a.db, sql)
-    try:
-        warm = loop.warm_up()
-        before = loop.runs
-        stacks, how = run(loop.proc.pid, seconds, raw)
-        runs = loop.runs - before
-    finally:
-        loop.close()
+    label, sql, db = resolve(a.target, a.sql, a.db)
+    stacks, how, warm, runs = sample_query(duckdb, db, sql, run, seconds, raw)
     print(f"perf-sample {label}")
-    print(f"  duckdb {duckdb}   db {a.db}")
+    print(f"  duckdb {duckdb}   db {db}")
     print(f"  profiler: {how}")
     each = f", about {1000 * seconds / runs:.0f} ms each" if runs else "; no run finished inside the window"
     print(f"  warm-up run {warm:.3f} s (not profiled), then {seconds} s sampled while the query ran {runs} times{each}")

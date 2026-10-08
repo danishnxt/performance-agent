@@ -26,6 +26,8 @@ import tempfile
 from pathlib import Path
 
 BENCH_DATA_DIR = "duckdb_benchmark_data"
+# Estimate errors are only worth a look on operators that take a real share of the time.
+ESTIMATE_FLAG_MIN_SHARE = 0.05
 
 
 def die(msg):
@@ -187,6 +189,11 @@ def main():
     summarise(json.loads(Path(prof).read_text()), label, duckdb, a.db, a.all)
 
 
+def estimate_off(node):
+    e, r = est(node), rows(node)
+    return bool(e and r and max(e / r, r / e) >= 10)
+
+
 def summarise(data, label, duckdb, db, show_all):
     roots = data.get("operator") or data.get("children") or []
     roots = roots if isinstance(roots, list) else [roots]
@@ -232,15 +239,19 @@ def summarise(data, label, duckdb, db, show_all):
             flags = []
             if "HASH" in kind(o) and build > probe and build > 1000:
                 flags.append(f"BUILD>PROBE ({build / max(probe, 1):.1f}x)")
-            e = est(o)
-            if e and rows(o) and max(e / rows(o), rows(o) / e) >= 10:
-                flags.append("estimate off >=10x")
+            if estimate_off(o) and timing(o) / total >= ESTIMATE_FLAG_MIN_SHARE:
+                flags.append("hint: estimate off >=10x")
             print(f"{o['_id']:>3}  {kind(o):<22} {human(probe):>10} {human(build):>10} {human(rows(o)):>9}  {' '.join(flags)}")
 
-    off = [o for o in ops if est(o) and rows(o) and max(est(o) / rows(o), rows(o) / est(o)) >= 10 and "JOIN" not in kind(o)]
+    off = [o for o in ops if estimate_off(o) and timing(o) / total >= ESTIMATE_FLAG_MIN_SHARE and "JOIN" not in kind(o)]
     if off:
+        off.sort(key=timing, reverse=True)
         print()
-        print("Other operators whose row estimate is off by >=10x: " + ", ".join(f"{o['_id']} {kind(o)}" for o in off[:12]))
+        print(
+            f"Hint, not a finding: row estimate off by >=10x on operators with >={ESTIMATE_FLAG_MIN_SHARE:.0%} of the time, "
+            "by time: " + ", ".join(f"{o['_id']} {kind(o)} ({100 * timing(o) / total:.0f}%)" for o in off[:12])
+        )
+        print("  A bad estimate matters only if it led to a slow choice; check that before chasing it.")
 
 
 if __name__ == "__main__":
