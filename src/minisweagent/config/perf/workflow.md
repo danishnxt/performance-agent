@@ -50,6 +50,10 @@ The absence of history is not evidence that there is no regression. Read the cod
 - Do not change behaviour or results to gain speed. Run the correctness checks after every fix.
 - Revert changes that did not measurably help. Leave only the fixes you measured.
 
+## Fresh looks
+
+After several rebuilds without a fix, you will get a message headed "Fresh look". It is the answer of a separate reviewer that saw only the file you have worked on most, not your work or your measurements. Test its suggestion next, before going back to your own line of investigation: you may be circling. It can be wrong, so treat it like any hypothesis: one change, rebuild, measure, keep it only if the benchmark confirms it.
+
 ## Working tips
 
 - Reduce the problem to the smallest input that still shows the slowdown.

@@ -66,6 +66,7 @@ def build(
         config["environment"]["env"]["PATH"] = f"{tools_dir}:{os.environ['PATH']}"
     config["agent"]["instance_template"] = template[:start] + middle + SUBMIT + template[end:]
     config["agent"]["system_template"] = SYSTEM
+    config["agent"]["agent_class"] = "minisweagent.agents.perf.PerfAgent"
     return config
 
 
