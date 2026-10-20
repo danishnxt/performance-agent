@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Compare two CPython builds, workload by workload, against the noise floor.
+
+Usage:
+  perf-compare A B                  e.g. perf-compare $TMPDIR/before/build/python.exe build/python.exe
+  perf-compare A B w05 w13          only these workloads (default: every benchmarks/workloads/w*.py)
+
+Options:
+  --rounds N      rounds of both interpreters (default 5); the first round is a warm-up and is dropped
+  --runs N        timed runs per workload per round (default 3)
+
+A and B are python executables. It runs A and B alternately, swapping which goes first each round, so machine
+drift hits both alike. Each workload runs in a fresh interpreter: one untimed run, then the timed runs. For
+each workload it prints the median time of A and B and a verdict: faster or slower only if the change is
+beyond the noise floor (5% per workload, 2% for the suite total), otherwise "no change beyond noise".
+Run it from the repository root.
+"""
+
+import argparse
+import statistics
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+WORKLOAD_NOISE = 0.05
+SUITE_NOISE = 0.02
+CHILD = """
+import importlib.util, sys, time
+spec = importlib.util.spec_from_file_location("w", sys.argv[1])
+w = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(w)
+w.run()
+for _ in range(int(sys.argv[2])):
+    t = time.perf_counter()
+    w.run()
+    print(time.perf_counter() - t)
+"""
+
+
+def die(msg):
+    print(f"perf-compare: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run_once(python, workload, runs):
+    proc = subprocess.run([python, "-B", "-c", CHILD, str(workload), str(runs)], capture_output=True, text=True)
+    if proc.returncode != 0:
+        die(f"{python} failed on {workload.stem}: {proc.stderr.strip()[-500:]}")
+    return [float(x) for x in proc.stdout.split()]
+
+
+def verdict(a, b, noise):
+    change = (b - a) / a
+    if change <= -noise:
+        return change, "faster"
+    if change >= noise:
+        return change, "SLOWER"
+    return change, "no change beyond noise"
+
+
+def main():
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("a", nargs="?")
+    p.add_argument("b", nargs="?")
+    p.add_argument("names", nargs="*")
+    p.add_argument("--rounds", type=int, default=5)
+    p.add_argument("--runs", type=int, default=3)
+    p.add_argument("-h", "--help", action="store_true")
+    a = p.parse_args()
+    if a.help or not (a.a and a.b):
+        print(__doc__)
+        sys.exit(0 if a.help else 2)
+    for python in (a.a, a.b):
+        if not Path(python).is_file():
+            die(f"not found: {python}")
+    if Path(a.a).resolve() == Path(a.b).resolve():
+        print("perf-compare: A and B are the same file; this measures noise only.", file=sys.stderr)
+    workloads = sorted(Path("benchmarks/workloads").glob("w*.py"))
+    if a.names:
+        workloads = [w for w in workloads if w.stem in a.names]
+    if not workloads:
+        die("no workloads found; run it from the repository root")
+    rounds = max(2, a.rounds)
+
+    times = {"A": defaultdict(list), "B": defaultdict(list)}
+    for r in range(rounds):
+        order = (("A", a.a), ("B", a.b))
+        for name, python in order if r % 2 == 0 else order[::-1]:
+            for w in workloads:
+                got = run_once(python, w, a.runs)
+                if r:
+                    times[name][w.stem].extend(got)
+
+    print(f"perf-compare  A = {a.a}")
+    print(f"              B = {a.b}")
+    print(f"  {len(workloads)} workloads; {rounds - 1} rounds of A and B (order swapped each round) after one warm-up round, {a.runs} runs each.")
+    print(f"  Medians in ms. change = (B - A) / A. Noise floor: {WORKLOAD_NOISE:.0%} per workload, {SUITE_NOISE:.0%} suite.")
+    print()
+    print(f"{'workload':<10} {'A ms':>9} {'B ms':>9} {'change':>8}  verdict")
+    total_a = total_b = 0.0
+    for w in workloads:
+        ma, mb = statistics.median(times["A"][w.stem]), statistics.median(times["B"][w.stem])
+        total_a, total_b = total_a + ma, total_b + mb
+        change, word = verdict(ma, mb, WORKLOAD_NOISE)
+        print(f"{w.stem:<10} {1000 * ma:>9.2f} {1000 * mb:>9.2f} {change:>+7.1%}  {word}")
+    change, word = verdict(total_a, total_b, SUITE_NOISE)
+    print(f"{'suite':<10} {1000 * total_a:>9.2f} {1000 * total_b:>9.2f} {change:>+7.1%}  {word}")
+
+
+if __name__ == "__main__":
+    main()

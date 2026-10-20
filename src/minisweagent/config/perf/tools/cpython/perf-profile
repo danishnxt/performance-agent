@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Python-level profile of one workload or script: which Python and built-in functions the time goes to.
+
+Usage:
+  perf-profile w05                  a workload from benchmarks/workloads/
+  perf-profile SCRIPT.py [ARGS]     any script (runs it once, profiled)
+
+Options:
+  --python PATH   interpreter to profile with (default: build/python.exe)
+  --seconds N     for a workload: keep calling run() for about N seconds (default 2)
+  --top N         rows per table (default 25)
+
+It uses cProfile inside the interpreter under test. For a workload it calls run() once to warm up (not
+profiled), then profiles repeated run() calls. It prints the functions by own time (time in the function's
+own code) and by cumulative time (own code plus everything it calls), with call counts and where each lives.
+Functions written in C show as {built-in method ...} or {method ... of ... objects}: their time is the C code.
+cProfile adds overhead to every Python call, so use the benchmark runner for timings.
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+CHILD = r"""
+import cProfile, importlib.util, json, pstats, runpy, sys, time
+mode, target, seconds = sys.argv[1], sys.argv[2], float(sys.argv[3])
+prof = cProfile.Profile()
+runs = 0
+if mode == "workload":
+    spec = importlib.util.spec_from_file_location("w", target)
+    w = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(w)
+    w.run()
+    end = time.perf_counter() + seconds
+    prof.enable()
+    while runs == 0 or time.perf_counter() < end:
+        w.run()
+        runs += 1
+    prof.disable()
+else:
+    sys.argv = [target] + sys.argv[4:]
+    prof.enable()
+    try:
+        runpy.run_path(target, run_name="__main__")
+    finally:
+        prof.disable()
+    runs = 1
+stats = pstats.Stats(prof).stats
+rows = [[f, l, n, nc, pc, tt, ct] for (f, l, n), (pc, nc, tt, ct, _) in stats.items()]
+print("PERF-PROFILE " + json.dumps({"runs": runs, "rows": rows}))
+"""
+
+
+def die(msg):
+    print(f"perf-profile: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def label(file, line, name):
+    if file == "~":
+        return name, ""
+    try:
+        file = str(Path(file).resolve().relative_to(Path.cwd()))
+    except ValueError:
+        pass
+    return name, f"{file}:{line}"
+
+
+def main():
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("target", nargs="?")
+    p.add_argument("args", nargs=argparse.REMAINDER)
+    p.add_argument("--python", default="build/python.exe")
+    p.add_argument("--seconds", type=float, default=2)
+    p.add_argument("--top", type=int, default=25)
+    p.add_argument("-h", "--help", action="store_true")
+    a = p.parse_args()
+    if a.help or not a.target:
+        print(__doc__)
+        sys.exit(0 if a.help else 2)
+    if not Path(a.python).is_file():
+        die(f"interpreter not found: {a.python} (build first, or pass --python)")
+    workload = Path("benchmarks/workloads") / f"{a.target}.py"
+    if workload.is_file():
+        mode, target = "workload", workload
+    elif Path(a.target).is_file():
+        mode, target = "script", Path(a.target)
+    else:
+        die(f"no workload or script named {a.target}")
+
+    proc = subprocess.run(
+        [a.python, "-B", "-c", CHILD, mode, str(target), str(a.seconds), *a.args], capture_output=True, text=True
+    )
+    line = next((l for l in proc.stdout.splitlines() if l.startswith("PERF-PROFILE ")), None)
+    if proc.returncode != 0 or not line:
+        die(f"profiling failed: {proc.stderr.strip()[-800:]}")
+    data = json.loads(line[len("PERF-PROFILE "):])
+    rows, runs = data["rows"], data["runs"]
+    total = sum(r[5] for r in rows) or 1e-9
+
+    print(f"perf-profile {a.target}   ({a.python}, cProfile)")
+    if mode == "workload":
+        print(f"  warm-up run() not profiled, then {runs} profiled run() calls; ms are per run() call, calls are totals over all {runs}.")
+    print("  own = time in the function's own code; cum = own code plus everything it calls. % of profiled time.")
+    print()
+    for title, key in (("By own time:", 5), ("By cumulative time:", 6)):
+        print(title)
+        print(f"{'own%':>6} {'cum%':>6} {'own ms':>9} {'calls':>10}  {'function':<48} where")
+        for f, l, n, nc, pc, tt, ct in sorted(rows, key=lambda r: -r[key])[: a.top]:
+            name, where = label(f, l, n)
+            calls = f"{nc}" if nc == pc else f"{nc}/{pc}"
+            print(f"{100 * tt / total:>5.1f}% {100 * ct / total:>5.1f}% {1000 * tt / runs:>9.3f} {calls:>10}  {name[:48]:<48} {where}")
+        print()
+
+
+if __name__ == "__main__":
+    main()

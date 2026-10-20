@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""CPU profile of CPython while it runs a workload or a command: which C functions the CPU time goes to.
+
+Usage:
+  perf-sample w05                   a workload from benchmarks/workloads/, run over and over
+  perf-sample -- CMD [ARGS]         any command, e.g. perf-sample -- build/python.exe script.py
+  perf-sample --pid PID             a process that is already running
+  perf-sample --compare w05 w16     profile two workloads and list the functions whose share of CPU time
+                                    differs most between them
+
+Options:
+  --python PATH   interpreter for workloads (default: build/python.exe)
+  --seconds N     how long to sample (default 5)
+  --top N         rows per table (default 25)
+  --raw PATH      also keep the profiler's raw output at PATH
+
+For a workload it starts the interpreter, calls run() once to warm up, then calls it over and over while the
+profiler samples the process; start-up and the warm-up run are not in the profile. Idle threads and time spent
+waiting are dropped. Uses macOS `sample` or Linux `perf`; no sudo needed on macOS.
+
+It sees the interpreter's C code. Time spent running Python code shows up as the interpreter loop
+(_PyEval_EvalFrameDefault and friends), not as Python function names: use perf-profile for those.
+--compare is for a slow workload and a similar fast one: the functions the slow one spends more of its time in
+point at what makes it slow.
+"""
+
+import argparse
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+# The interpreter's own binary: frames from it get a source file, frames from other libraries get the library name.
+MAIN_BINARY = "python.exe"
+
+# Leaf frames that mean the thread was waiting, not computing.
+IDLE = re.compile(
+    r"^(__psynch_cvwait|__psynch_mutexwait|__workq_kernreturn|__semwait_signal|semaphore_\w*wait\w*|mach_msg\w*|"
+    r"__ulock_wait\w*|kevent\w*|__select|poll|__read_nocancel|read|nanosleep|__sleep|swtch_pri|thread_switch|"
+    r"futex_wait\w*|do_futex|epoll_wait|__futex_abstimed_wait\w*|syscall|pthread_cond_\w*wait|start_wqthread)$"
+)
+# Entry frames that every busy thread runs through; hidden from the inclusive table when they hold nearly everything.
+ENTRY_SHARE = 0.95
+
+
+def die(msg):
+    print(f"perf-sample: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def short_name(name, width=96):
+    return name if len(name) <= width else name[: width - 1] + "…"
+
+
+# ---- macOS: sample --------------------------------------------------------------------------------------------
+
+MAC_LINE = re.compile(r"^(?P<prefix>[\s+!:|]*)(?P<count>\d+) (?P<rest>.*)$")
+MAC_FRAME = re.compile(r"^(?P<sym>.*?)\s+\(in (?P<lib>[^)]+)\)(?:\s+\+ [\d,.]+)?(?:\s+\[[^\]]*\])?(?:\s+(?P<src>\S+:[\d,.]+))?\s*$")
+
+
+def parse_mac(text):
+    """Turn `sample`'s call graph into (thread, stack root->leaf, self samples)."""
+    lines = text.split("Call graph:", 1)[-1].split("\n\n")[0].splitlines()
+    nodes, path, thread = [], [], None  # nodes: [thread, stack, count, children's count]; path: (indent, node index)
+    for line in lines:
+        m = MAC_LINE.match(line)
+        if not m:
+            continue
+        indent, count, rest = len(m["prefix"]), int(m["count"]), m["rest"]
+        if rest.startswith("Thread_"):
+            thread, path = rest.split()[0], []
+            continue
+        f = MAC_FRAME.match(rest)
+        frame = (f["sym"].strip(), f["lib"], f["src"]) if f else (rest.strip(), "?", None)
+        while path and path[-1][0] >= indent:
+            path.pop()
+        stack = (nodes[path[-1][1]][1] if path else []) + [frame]
+        if path:
+            nodes[path[-1][1]][3] += count
+        path.append((indent, len(nodes)))
+        nodes.append([thread, stack, count, 0])
+    # A node's own samples are its count minus its children's.
+    return [(t, stack, count - below) for t, stack, count, below in nodes if count > below]
+
+
+def run_mac(pid, seconds, raw):
+    if not shutil.which("sample"):
+        die("macOS `sample` not found")
+    proc = subprocess.run(["sample", str(pid), str(seconds), "1", "-mayDie", "-file", raw], capture_output=True, text=True)
+    if not Path(raw).is_file():
+        die(f"sample failed: {proc.stderr.strip()[:300] or proc.stdout.strip()[:300]}")
+    return parse_mac(Path(raw).read_text(errors="replace")), "macOS sample, 1 ms per thread"
+
+
+# ---- Linux: perf ----------------------------------------------------------------------------------------------
+
+LINUX_FRAME = re.compile(r"^\s*[0-9a-f]+\s+(?P<sym>.+?)(?:\+0x[0-9a-f]+)?\s+\((?P<lib>[^)]*)\)\s*$")
+
+
+def parse_linux(text):
+    out = []
+    for block in text.split("\n\n"):
+        lines = [l for l in block.splitlines() if l.strip()]
+        if not lines:
+            continue
+        head = lines[0].split()
+        thread = head[1] if len(head) > 1 else "?"
+        frames = []
+        for line in lines[1:]:
+            m = LINUX_FRAME.match(line)
+            if m:
+                frames.append((m["sym"], Path(m["lib"]).name, None))
+        if frames:
+            out.append((thread, frames[::-1], 1))
+    return out
+
+
+def run_linux(pid, seconds, raw):
+    if not shutil.which("perf"):
+        die("`perf` not found; install linux-tools for this kernel")
+    data = raw + ".data"
+    rec = subprocess.run(["perf", "record", "-F", "999", "-g", "-p", str(pid), "-o", data, "--", "sleep", str(seconds)], capture_output=True, text=True)
+    if rec.returncode != 0 or not Path(data).is_file():
+        die(f"perf record failed (check /proc/sys/kernel/perf_event_paranoid): {rec.stderr.strip()[:300]}")
+    script = subprocess.run(["perf", "script", "-i", data, "-F", "comm,tid,ip,sym,dso"], capture_output=True, text=True)
+    Path(raw).write_text(script.stdout)
+    return parse_linux(script.stdout), "Linux perf record, 999 Hz per thread"
+
+
+# ---- report ---------------------------------------------------------------------------------------------------
+
+
+def tally(stacks):
+    """Busy samples per function (self and inclusive), with where each function lives."""
+    busy_by_thread, idle_threads = Counter(), set()
+    own, incl, files, libs = Counter(), Counter(), defaultdict(Counter), {}
+    for thread, stack, count in stacks:
+        stack = [(short_name(s, 10**6), l, f) for s, l, f in stack]
+        sym = stack[-1][0]
+        if IDLE.match(sym):
+            idle_threads.add(thread)
+            continue
+        busy_by_thread[thread] += count
+        own[sym] += count
+        for s, l, f in stack:
+            libs.setdefault(s, l)
+            if f:
+                files[s][f.rsplit(":", 1)[0]] += count
+        for s in {s for s, _, _ in stack}:
+            incl[s] += count
+    total = sum(busy_by_thread.values())
+    if not total:
+        die("no busy CPU samples; the workload may have finished before sampling started (try a longer --seconds)")
+    dropped = len(idle_threads - set(busy_by_thread))
+
+    def where(sym):
+        f = files[sym].most_common(1)
+        lib = libs.get(sym, "?")
+        return f[0][0] if f else ("" if lib == MAIN_BINARY else f"({lib})")
+
+    return own, incl, total, len(busy_by_thread), dropped, where, libs
+
+
+def report(stacks, top):
+    own, incl, total, threads, dropped, where, libs = tally(stacks)
+    print(f"  {total:,} busy samples across {threads} threads ({dropped} idle threads dropped).")
+    print("  self = CPU in the function's own code; incl = own code plus everything it calls. % of busy samples.")
+    print()
+    print("By self time:")
+    print(f"{'self%':>6} {'incl%':>6}  {'function':<96}  file")
+    for sym, n in own.most_common(top):
+        print(f"{100 * n / total:>5.1f}% {100 * incl[sym] / total:>5.1f}%  {short_name(sym):<96}  {where(sym)}")
+    print()
+    print("By inclusive time:")
+    print(f"{'incl%':>6} {'self%':>6}  {'function':<96}  file")
+    hidden, shown = 0, 0
+    for sym, n in incl.most_common():
+        if n / total >= ENTRY_SHARE or libs.get(sym, MAIN_BINARY) != MAIN_BINARY and own[sym] / total < 0.01:
+            hidden += 1
+            continue
+        print(f"{100 * n / total:>5.1f}% {100 * own[sym] / total:>5.1f}%  {short_name(sym):<96}  {where(sym)}")
+        shown += 1
+        if shown >= top:
+            break
+    if hidden:
+        print(f"  (thread entry frames above {ENTRY_SHARE:.0%} and system-library frames hidden)")
+
+
+def compare(a, b, top):
+    """Functions whose share of busy CPU time differs most between profile a and profile b."""
+    (own_a, incl_a, total_a, *_ , where_a, _), (own_b, incl_b, total_b, *_, where_b, _) = tally(a[1]), tally(b[1])
+    pct = lambda c, t, s: 100 * c[s] / t
+    rows = []
+    for sym in set(own_a) | set(own_b):
+        sa, sb = pct(own_a, total_a, sym), pct(own_b, total_b, sym)
+        ia, ib = pct(incl_a, total_a, sym), pct(incl_b, total_b, sym)
+        rows.append((sb - sa, sa, sb, ia, ib, sym))
+    print(f"  A = {a[0]}   B = {b[0]}")
+    print(f"  {total_a:,} busy samples in A, {total_b:,} in B. % of each workload's own busy samples; diff = B - A.")
+    print("  A function B spends much more of its time in is where to look if B is the slow one.")
+    print()
+    print(f"{'diff':>6} {'A self':>7} {'B self':>7} {'A incl':>7} {'B incl':>7}  {'function':<96}  file")
+    for d, sa, sb, ia, ib, sym in sorted(rows, key=lambda r: -abs(r[0]))[:top]:
+        print(f"{d:>+5.1f}% {sa:>6.1f}% {sb:>6.1f}% {ia:>6.1f}% {ib:>6.1f}%  {short_name(sym):<96}  {where_b(sym) or where_a(sym)}")
+
+
+# ---- running the workload -------------------------------------------------------------------------------------
+
+LOOP = r"""
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("w", sys.argv[1])
+w = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(w)
+w.run()
+print("ready", flush=True)
+while True:
+    w.run()
+    print(".", flush=True)
+"""
+
+
+class WorkloadLoop:
+    """The interpreter calling a workload's run() over and over; counts finished runs."""
+
+    def __init__(self, python, workload):
+        self.proc = subprocess.Popen(
+            [python, "-B", "-c", LOOP, str(workload)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
+        )
+        self.runs = 0
+
+    def warm_up(self):
+        start = time.time()
+        if self.proc.stdout.readline().strip() != "ready":
+            die("workload failed: " + self.proc.stderr.read()[-500:])
+        threading.Thread(target=self._count, daemon=True).start()
+        return time.time() - start
+
+    def _count(self):
+        for _ in self.proc.stdout:
+            self.runs += 1
+
+    def close(self):
+        self.proc.kill()
+        self.proc.wait()
+
+
+def resolve(name):
+    workload = Path("benchmarks/workloads") / f"{name}.py"
+    if not workload.is_file():
+        die(f"no workload {workload}; run it from the repository root, or use -- CMD for anything else")
+    return workload
+
+
+def sample_workload(python, workload, run, seconds, raw):
+    loop = WorkloadLoop(python, workload)
+    try:
+        warm = loop.warm_up()
+        before = loop.runs
+        stacks, how = run(loop.proc.pid, seconds, raw)
+        runs = loop.runs - before
+    finally:
+        loop.close()
+    return stacks, how, warm, runs
+
+
+def main():
+    argv = sys.argv[1:]
+    command = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, command = argv[:i], argv[i + 1 :]
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("target", nargs="?")
+    p.add_argument("--pid", type=int)
+    p.add_argument("--python", default="build/python.exe")
+    p.add_argument("--seconds", type=float, default=5)
+    p.add_argument("--top", type=int, default=25)
+    p.add_argument("--raw")
+    p.add_argument("--compare", nargs=2)
+    p.add_argument("-h", "--help", action="store_true")
+    a = p.parse_args(argv)
+    if a.help or not (a.target or a.pid or a.compare or command):
+        print(__doc__)
+        sys.exit(0 if a.help else 2)
+
+    system = platform.system()
+    if system not in ("Darwin", "Linux"):
+        die(f"unsupported platform {system}")
+    run = run_mac if system == "Darwin" else run_linux
+    raw = a.raw or os.path.join(tempfile.mkdtemp(prefix="perf-sample-"), "raw.txt")
+    seconds = max(1, round(a.seconds))
+
+    if a.pid:
+        print(f"perf-sample --pid {a.pid}")
+        stacks, how = run(a.pid, seconds, raw)
+        print(f"  profiler: {how}; sampled {seconds} s of a running process")
+        report(stacks, a.top)
+        return
+
+    if command:
+        proc = subprocess.Popen(command)
+        try:
+            stacks, how = run(proc.pid, seconds, raw)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+        print(f"perf-sample -- {' '.join(command)}")
+        print(f"  profiler: {how}; sampled the first {seconds} s (start-up included; the process is stopped after)")
+        report(stacks, a.top)
+        return
+
+    if not Path(a.python).is_file():
+        die(f"interpreter not found: {a.python} (build first, or pass --python)")
+    if a.compare:
+        profiles = []
+        for i, name in enumerate(a.compare):
+            stacks, how, warm, runs = sample_workload(a.python, resolve(name), run, seconds, f"{raw}.{'AB'[i]}")
+            profiles.append((name, stacks))
+        print(f"perf-sample --compare {a.compare[0]} {a.compare[1]}")
+        print(f"  python {a.python}")
+        print(f"  profiler: {how}; {seconds} s sampled per workload")
+        compare(*profiles, a.top)
+        return
+
+    stacks, how, warm, runs = sample_workload(a.python, resolve(a.target), run, seconds, raw)
+    print(f"perf-sample {a.target}")
+    print(f"  python {a.python}")
+    print(f"  profiler: {how}")
+    each = f", about {1000 * seconds / runs:.0f} ms each" if runs else "; no run finished inside the window"
+    print(f"  warm-up run {warm:.3f} s (not profiled), then {seconds} s sampled while run() ran {runs} times{each}")
+    report(stacks, a.top)
+
+
+if __name__ == "__main__":
+    main()
