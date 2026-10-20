@@ -7,8 +7,12 @@ from minisweagent.environments.local import LocalEnvironment, LocalEnvironmentCo
 class SandboxedLocalEnvironmentConfig(LocalEnvironmentConfig):
     profile: str
     """macOS sandbox-exec profile applied to every command."""
-    unset_env: list[str] = ["OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "LOCAL_API_KEY"]
-    """Variables removed from each command's environment, so the agent cannot read the model's API key."""
+    unset_env: list[str] = [
+        *("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "LOCAL_API_KEY"),
+        *("PYTHONPATH", "MINI_REPO", "WORKSPACE", "PERF", "TARGET", "MSWEA_CONFIGURED", "MSWEA_GLOBAL_CONFIG_DIR"),
+    ]
+    """Variables removed from each command's environment: the model's API keys, and the harness's own settings, which
+    name the experiment and its folders (PYTHONPATH would also change what the target's Python imports)."""
 
 
 class SandboxedLocalEnvironment(LocalEnvironment):
