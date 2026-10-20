@@ -27,7 +27,10 @@ from minisweagent.agents.interactive import InteractiveAgent, InteractiveAgentCo
 logger = logging.getLogger("perf_agent")
 
 SOURCE_FILE = re.compile(r"(?<![\w.-])((?:[\w.-]+/)*[\w-]+\.(?:cpp|cc|cxx|c|hpp|hh|hxx|h|inl))(?![\w.])")
-REBUILD = re.compile(r"\bmake\b[^;&|]*\bbuild/|\bcmake\s+--build\b|\bninja\b")
+# `make -C build/reldebug ...` (DuckDB), and `cd build && make` or `make -C build` (CPython's out-of-tree build).
+REBUILD = re.compile(
+    r"(?:^|[;&|(\n]\s*)(?:(?:time|nice|timeout\s+\S+)\s+)*make\b[^;&|]*\bbuild\b|\bcd\s+\S*build\S*\s*&&\s*make\b|\bcmake\s+--build\b|\bninja\b"
+)
 VIEW_RANGE = re.compile(r"sed\s+-n\s+['\"]?(\d+),(\d+)p")
 HEAD_RANGE = re.compile(r"\bhead\s+-(?:n\s*)?(\d+)\b")
 DIFF_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? ", re.M)

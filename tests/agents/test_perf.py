@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from minisweagent.agents.perf import PerfAgent
+from minisweagent.agents.perf import REBUILD, PerfAgent
 from minisweagent.environments.local import LocalEnvironment
 from minisweagent.models.test_models import DeterministicModel, make_output
 
@@ -83,3 +83,22 @@ def test_fresh_look_moves_to_next_file_and_uses_changed_lines(repo):
 def test_fresh_look_off(repo):
     agent = run_agent(repo, ["echo 1 >> src/a.cpp && make -C build/x", "echo 2 >> src/a.cpp && make -C build/x"], fresh_look_rebuilds=0)
     assert fresh_messages(agent) == [] and agent.fresh_looks == []
+
+
+@pytest.mark.parametrize(
+    ("command", "is_rebuild"),
+    [
+        ("make -C build/reldebug -j shell benchmark_runner", True),
+        ("cd build && make -j", True),
+        ("cd /repo/build && make -j15 2>&1 | tail", True),
+        ("make -C build -j", True),
+        ("cd /repo && time make -C build/reldebug shell", True),
+        ("cmake --build build/release", True),
+        ("cd /repo && timeout 280 make -C build/reldebug -j shell", True),
+        ("cp a.bak src/a.cpp\nmake -C build/reldebug shell", True),
+        ("make -j", False),
+        ("grep -n make src/build.c", False),
+    ],
+)
+def test_rebuild_commands(command, is_rebuild):
+    assert bool(REBUILD.search(command)) is is_rebuild
