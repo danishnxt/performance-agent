@@ -113,6 +113,21 @@ def test_a_try_fails_only_if_nothing_got_faster_than_last_measured(repo):
     assert [(r["path"], r["trigger"], r["step"]) for r in fresh_records(agent)] == [("src/b.cpp", "failed", 3)]
 
 
+def test_symptom_known_from_the_harness_measurement_before_any_perf_compare(repo, tmp_path_factory):
+    measured = tmp_path_factory.mktemp("golden") / "duckdb.measured.csv"
+    measured.write_text("name,ms\nq19,65.0\nq06,18.0\nq01,52.0\n")
+    agent = run_agent(
+        repo,
+        ["cat src/a.cpp", "cat src/a.cpp", "cat src/b.cpp", compare("q19 65.0 25.0 -61.5% faster"), "cat src/b.cpp"],
+        fresh_look_baseline="BASELINE.csv",
+        fresh_look_measured=str(measured),
+    )
+    assert [r["symptom"] for r in fresh_records(agent)] == [
+        "Q19 2.6x, Q06 1.5x slower than baseline; the other 1 measured benchmarks are within 25% of it",
+        "Q06 1.5x slower than baseline; the other 2 measured benchmarks are within 25% of it",  # the agent fixed Q19
+    ]
+
+
 def test_one_fresh_look_per_file(repo):
     agent = run_agent(repo, ["cat src/a.cpp", "cat src/a.cpp", "cat src/a.cpp src/b.cpp", "cat src/b.cpp"])
     assert [(r["path"], r["step"]) for r in fresh_records(agent)] == [("src/a.cpp", 2), ("src/b.cpp", 4)]

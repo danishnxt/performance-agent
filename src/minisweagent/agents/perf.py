@@ -81,6 +81,12 @@ REASONS = {
 }
 
 
+def read_times(path: Path) -> dict[str, float]:
+    """`name,ms` rows of a CSV, keyed by lower-case name; {} if the file is missing."""
+    rows = csv.reader(path.read_text().splitlines()) if path.is_file() else []
+    return {name.lower(): float(ms) for name, ms in rows if ms.replace(".", "", 1).isdigit()}
+
+
 def render(template: str, **kwargs) -> str:
     return Template(template, undefined=StrictUndefined, keep_trailing_newline=True).render(**kwargs)
 
@@ -95,7 +101,10 @@ class PerfAgentConfig(InteractiveAgentConfig):
     fresh_look_project: str = ""
     """What the program is, for the reviewer, e.g. "DuckDB, an analytical SQL database engine"."""
     fresh_look_baseline: str = ""
-    """CSV in the repository with `query,ms` baseline timings; the symptom is the latest perf-compare B column over it."""
+    """CSV in the repository with `name,ms` baseline timings; the symptom is the latest measured time over it."""
+    fresh_look_measured: str = ""
+    """CSV with `name,ms` timings of the planted build, measured by the harness before the run (scripts/measure_golden.sh),
+    so the symptom is known before the agent's first perf-compare."""
     fresh_look_slow_ratio: float = 1.25
     """A benchmark counts as slow in the symptom at this many times its baseline time."""
     fresh_look_deadline_seconds: int = 600
@@ -109,7 +118,7 @@ class PerfAgent(InteractiveAgent):
         super().__init__(*args, config_class=config_class, **kwargs)
         self.files: dict[str, Counter] = {}
         self.viewed: dict[str, tuple[int, int]] = {}
-        self.measured: dict[str, float] = {}
+        self.measured = read_times(Path(self.config.fresh_look_measured)) if self.config.fresh_look_measured else {}
         self.fresh_looks: list[dict] = []
         self._diffs: dict[str, str] = {}
         self._tracked: set[str] | None = None
@@ -213,11 +222,9 @@ class PerfAgent(InteractiveAgent):
     def _symptom(self) -> str:
         """The latest measured time of each query over its baseline, from the agent's own perf-compare runs."""
         if self._baseline is None:
-            path = self._repo() / self.config.fresh_look_baseline
-            rows = (
-                csv.reader(path.read_text().splitlines()) if self.config.fresh_look_baseline and path.is_file() else []
+            self._baseline = (
+                read_times(self._repo() / self.config.fresh_look_baseline) if self.config.fresh_look_baseline else {}
             )
-            self._baseline = {q.lower(): float(ms) for q, ms in rows if ms.replace(".", "", 1).isdigit()}
         ratios = {q: ms / self._baseline[q] for q, ms in self.measured.items() if self._baseline.get(q)}
         slow = sorted(
             (q for q, r in ratios.items() if r >= self.config.fresh_look_slow_ratio), key=lambda q: -ratios[q]
