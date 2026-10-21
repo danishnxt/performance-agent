@@ -30,6 +30,13 @@ Do not combine it with any other command. <important>After this command, you can
 """
 
 
+# What the fresh-look reviewer is told about each target, and its baseline timings (`name,ms`) in the repository.
+FRESH_LOOK = {
+    "duckdb": ("DuckDB, an analytical SQL database engine", "benchmark/BASELINE_SF10.csv"),
+    "cpython": ("CPython, the reference Python interpreter", "benchmarks/BASELINE.csv"),
+}
+
+
 def raw(text: str) -> str:
     """Keep Markdown out of Jinja's way."""
     return "{% raw %}" + text.strip() + "{% endraw %}\n\n"
@@ -64,6 +71,8 @@ def build(
             shutil.copytree(tools_dir, tools_dest, ignore=shutil.ignore_patterns("TOOLS.md"), dirs_exist_ok=True)
             tools_dir = tools_dest.resolve()
         config["environment"]["env"]["PATH"] = f"{tools_dir}:{os.environ['PATH']}"
+        if tools in FRESH_LOOK:
+            config["agent"]["fresh_look_project"], config["agent"]["fresh_look_baseline"] = FRESH_LOOK[tools]
     config["agent"]["instance_template"] = template[:start] + middle + SUBMIT + template[end:]
     config["agent"]["system_template"] = SYSTEM
     config["agent"]["agent_class"] = "minisweagent.agents.perf.PerfAgent"

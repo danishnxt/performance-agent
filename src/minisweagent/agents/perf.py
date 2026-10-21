@@ -1,15 +1,23 @@
-"""Performance agent: the interactive agent plus a fresh look for when it circles on one problem.
+"""Performance agent: the interactive agent plus a fresh look at a file the agent is circling.
 
-Every `fresh_look_rebuilds` rebuilds of changed source, the file the agent has worked on most since the last fresh look
-is sent to the same model in a separate request: no run history, no profiles, only that file, the lines the agent
-looked at, and one question. The answer goes back to the agent as a lead to test with the benchmark.
+A fresh look sends one file to the same model in a separate request: no run history, no profiles and none of the
+agent's theories, only the file, the lines the agent is on, the project and the measured symptom. The answer goes
+back to the agent as a lead to test with the benchmark. It fires once per file, when the agent
 
-Epoch 11 (LOGS/cold_check_q19_matrix): asked this way about the Q19 bug file, deepseek-v4.1-flash named the planted
-line 3/3. With the Q19 profiles attached it dropped to 1/3: it trusted the profile, which shows where time goes, not
-what caused it. So the request carries no profiles.
+- has named the file in `fresh_look_visits` steps without changing it (reading around it, not acting), or
+- changed the file, and the next `perf-compare` showed no benchmark faster than when it was last measured (a failed try).
+
+The request runs in the background, so the agent keeps working; the answer is handed back at the first step after
+it arrives.
+
+Epoch 11 (LOGS/cold_check_q19_matrix): with the Q19 profiles attached the model trusted them and named the planted
+line 1/3 instead of 3/3, so the request carries no profiles. Epoch 17 (fresh-look rewording): asked "is the regression
+caused at this location?" the model said yes about 76% of innocent files and confirmed the agent's wrong lead 6/6.
+Told the project, the measured symptom and that most files are innocent, it said yes about 20% of innocent files,
+rejected the wrong lead 6/6, and still named the Q19 bug 16/20.
 """
 
-import hashlib
+import csv
 import json
 import logging
 import re
@@ -34,29 +42,43 @@ REBUILD = re.compile(
 VIEW_RANGE = re.compile(r"sed\s+-n\s+['\"]?(\d+),(\d+)p")
 HEAD_RANGE = re.compile(r"\bhead\s+-(?:n\s*)?(\d+)\b")
 DIFF_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? ", re.M)
+DIFF_FILE = re.compile(r"^diff --git a/(\S+) b/", re.M)
+# One perf-compare row: benchmark, A ms, B ms, change, verdict.
+COMPARE_ROW = re.compile(r"^(\S+?)(?:\.benchmark)?\s+([\d.]+)\s+([\d.]+)\s+[+-][\d.]+%\s+(.+)$", re.M)
+COMPARE_NOISE = 0.08  # perf-compare's per-query noise floor
 
-QUESTION = """Some workloads of this program run much slower than their baseline: a performance regression. Below is \
-the source file {{ path }} with line numbers{{ excerpt }}.
+QUESTION = """You are reviewing one file of {{ project or "a program" }} during a hunt for a performance regression.
+{% if symptom %}
+Symptom (measured against the baseline): {{ symptom }}
+{% endif %}
+The engineer has spent the most time in {{ path }}{{ excerpt }}, at {{ location }}.
 
-Location of interest: {{ location }}.
+Most files read during a hunt like this are innocent. "Nothing here explains it" is a common, useful answer.
 
-Is the regression caused by code at this location? If yes, give the line numbers and explain why. If not, say what \
-the real cause is likely to be and where you would look next.
+1. Could code in this file cause this symptom? Answer yes or no first.
+2. If yes: the lines, the mechanism, and the cheapest experiment that would confirm it.
+3. If no: what kind of code elsewhere would produce this symptom, and what to search for to find it.
 
 === {{ path }} ===
 {{ code }}
 """
 
-HANDBACK = """Fresh look (automatic, after {{ rebuilds }} rebuilds of changed code). A separate reviewer that has not seen \
-your work, your measurements or this conversation was shown only `{{ path }}` and asked whether the regression is caused \
-at {{ location }}. Its answer:
+HANDBACK = """Fresh look (automatic: you {{ reason }}). A separate reviewer that has not seen your work, your theories or \
+this conversation was shown only `{{ path }}` at {{ location }}{% if symptom %} and the measured symptom{% endif %}, \
+and asked whether this file could cause the regression. Its answer:
 
 <fresh_look>
 {{ answer }}
 </fresh_look>
 
-This is a lead, not a fact. Test it next: make the smallest change that would show whether it is right, rebuild, \
-measure, and run the correctness checks. Keep it only if the benchmark confirms it; otherwise revert and carry on."""
+This is a lead, not a fact. If it names a cause, test it next: make the smallest change that would show whether it is \
+right, rebuild, measure, and run the correctness checks. Keep it only if the benchmark confirms it. If it says the \
+file is innocent, weigh that against your own evidence before spending more steps here."""
+
+REASONS = {
+    "visits": "have read `{path}` in {n} steps without changing it",
+    "failed": "changed `{path}` and the next perf-compare showed nothing getting faster",
+}
 
 
 def render(template: str, **kwargs) -> str:
@@ -64,8 +86,18 @@ def render(template: str, **kwargs) -> str:
 
 
 class PerfAgentConfig(InteractiveAgentConfig):
-    fresh_look_rebuilds: int = 5
-    """Ask for a fresh look after this many rebuilds of changed source since the last one. 0 turns it off."""
+    fresh_look_visits: int = 2
+    """Fresh look at a file named in this many steps while the agent has not changed it. 0 turns fresh looks off."""
+    fresh_look_failed_tries: int = 1
+    """Fresh look at a changed file after this many perf-compare runs with nothing faster. 0 turns this trigger off."""
+    fresh_look_max: int = 12
+    """At most this many fresh looks per run."""
+    fresh_look_project: str = ""
+    """What the program is, for the reviewer, e.g. "DuckDB, an analytical SQL database engine"."""
+    fresh_look_baseline: str = ""
+    """CSV in the repository with `query,ms` baseline timings; the symptom is the latest perf-compare B column over it."""
+    fresh_look_slow_ratio: float = 1.25
+    """A benchmark counts as slow in the symptom at this many times its baseline time."""
     fresh_look_deadline_seconds: int = 600
     """Cap on the whole fresh-look request. OpenRouter keep-alive padding defeats a socket timeout; one hung 17 min."""
     fresh_look_max_lines: int = 2500
@@ -75,21 +107,22 @@ class PerfAgentConfig(InteractiveAgentConfig):
 class PerfAgent(InteractiveAgent):
     def __init__(self, *args, config_class=PerfAgentConfig, **kwargs):
         super().__init__(*args, config_class=config_class, **kwargs)
-        self.rebuilds = 0
-        self.touched: Counter[str] = Counter()
+        self.files: dict[str, Counter] = {}
         self.viewed: dict[str, tuple[int, int]] = {}
-        self.sent: set[str] = set()
+        self.measured: dict[str, float] = {}
         self.fresh_looks: list[dict] = []
-        self._last_diff: str | None = None
+        self._diffs: dict[str, str] = {}
         self._tracked: set[str] | None = None
+        self._baseline: dict[str, float] | None = None
+        self._pending: list[tuple[dict, threading.Thread, dict]] = []
 
     def execute_actions(self, message: dict) -> list[dict]:
         result = super().execute_actions(message)
-        if self.config.fresh_look_rebuilds > 0:
+        if self.config.fresh_look_visits > 0:
             commands = [action.get("command", "") for action in message.get("extra", {}).get("actions", [])]
-            self._track(commands)
-            if self.rebuilds >= self.config.fresh_look_rebuilds:
-                result += self._fresh_look()
+            outputs = [m.get("extra", {}).get("raw_output", "") for m in result]
+            self._track(commands, outputs)
+            result += self._collect()
         return result
 
     # --- what the agent is circling ---
@@ -112,20 +145,62 @@ class PerfAgent(InteractiveAgent):
         matches = [f for f in self._tracked if f == ref or f.endswith("/" + ref)]
         return matches[0] if len(matches) == 1 else None
 
-    def _track(self, commands: list[str]) -> None:
+    def _file(self, path: str) -> Counter:
+        return self.files.setdefault(path, Counter(first_step=self.n_calls))
+
+    def _track(self, commands: list[str], outputs: list[str]) -> None:
         step_files = set()
         for command in commands:
             files = {f for ref in SOURCE_FILE.findall(command) if (f := self._resolve(ref))}
             step_files |= files
             if len(files) == 1 and (m := VIEW_RANGE.search(command) or HEAD_RANGE.search(command)):
                 lo, hi = (int(m[1]), int(m[2])) if m.re is VIEW_RANGE else (1, int(m[1]))
-                self.viewed[files.pop()] = (lo, hi)
-            if REBUILD.search(command):
-                diff = self._git("diff", "HEAD")
-                if diff and diff != self._last_diff:
-                    self.rebuilds += 1
-                self._last_diff = diff
-        self.touched.update(step_files)
+                self.viewed[next(iter(files))] = (lo, hi)
+        diff = self._git("diff", "HEAD")
+        diffs = dict(zip(DIFF_FILE.findall(diff), re.split(r"^diff --git ", diff, flags=re.M)[1:]))
+        for path in set(diffs) | set(self._diffs):
+            if diffs.get(path) != self._diffs.get(path):
+                self._file(path).update(edits=1, failed=-self._file(path)["failed"])
+        self._diffs = diffs
+        for path in step_files:
+            self._file(path).update(visits=1)
+        if any(REBUILD.search(c) for c in commands):
+            for path in diffs:
+                self._file(path).update(rebuilds=1)
+        for command, output in zip(commands, outputs):
+            if "perf-compare" in command and (rows := COMPARE_ROW.findall(output)):
+                # Agents keep comparing against the original build, so after one fix every compare shows something
+                # faster. A try failed if nothing got faster than the last time each query was measured.
+                now = {Path(name).name.lower(): float(b) for name, _, b, _ in rows if "suite" not in name}
+                before = {q: self.measured[q] for q in now if q in self.measured}
+                if before:
+                    improved = any(now[q] < (1 - COMPARE_NOISE) * ms for q, ms in before.items())
+                else:
+                    improved = any(v.strip().startswith("faster") for name, _, _, v in rows if "suite" not in name)
+                self.measured |= now
+                if not improved:
+                    for path in diffs:
+                        self._file(path).update(failed=1)
+        if not self._pending and len(self.fresh_looks) < self.config.fresh_look_max:
+            if trigger := self._trigger(step_files, diffs):
+                self._fresh_look(*trigger)
+
+    def _trigger(self, step_files: set[str], diffs: dict[str, str]) -> tuple[str, str] | None:
+        sent = {r["path"] for r in self.fresh_looks}
+        if self.config.fresh_look_failed_tries > 0:
+            failed = [
+                p for p in diffs if p not in sent and self.files[p]["failed"] >= self.config.fresh_look_failed_tries
+            ]
+            if failed:
+                return max(failed, key=lambda p: self.files[p]["visits"]), "failed"
+        circling = [
+            p
+            for p in step_files
+            if p not in sent and p not in diffs and self.files[p]["visits"] >= self.config.fresh_look_visits
+        ]
+        if circling:
+            return max(circling, key=lambda p: self.files[p]["visits"]), "visits"
+        return None
 
     def _location(self, path: str) -> tuple[int, int] | None:
         """The lines the agent changed, else the lines it last looked at. Edits come first: a last look is often a
@@ -135,16 +210,30 @@ class PerfAgent(InteractiveAgent):
             return min(s for s, _ in hunks), max(s + max(n, 1) - 1 for s, n in hunks)
         return self.viewed.get(path)
 
+    def _symptom(self) -> str:
+        """The latest measured time of each query over its baseline, from the agent's own perf-compare runs."""
+        if self._baseline is None:
+            path = self._repo() / self.config.fresh_look_baseline
+            rows = (
+                csv.reader(path.read_text().splitlines()) if self.config.fresh_look_baseline and path.is_file() else []
+            )
+            self._baseline = {q.lower(): float(ms) for q, ms in rows if ms.replace(".", "", 1).isdigit()}
+        ratios = {q: ms / self._baseline[q] for q, ms in self.measured.items() if self._baseline.get(q)}
+        slow = sorted(
+            (q for q, r in ratios.items() if r >= self.config.fresh_look_slow_ratio), key=lambda q: -ratios[q]
+        )
+        if not slow:
+            return ""
+        text = ", ".join(f"{q.upper()} {ratios[q]:.1f}x" for q in slow) + " slower than baseline"
+        if rest := len(ratios) - len(slow):
+            text += (
+                f"; the other {rest} measured benchmarks are within {self.config.fresh_look_slow_ratio - 1:.0%} of it"
+            )
+        return text
+
     # --- the fresh look ---
 
-    def _fresh_look(self) -> list[dict]:
-        rebuilds, self.rebuilds = self.rebuilds, 0
-        candidates = [f for f, _ in self.touched.most_common() if f not in self.sent]
-        self.touched.clear()
-        if not candidates:
-            return []
-        path = candidates[0]
-        self.sent.add(path)
+    def _fresh_look(self, path: str, why: str) -> None:
         lines = (self._git("show", f"HEAD:{path}") or "").splitlines()
         span = self._location(path)
         location = f"lines {span[0]}-{span[1]}" if span else "the whole file"
@@ -155,24 +244,75 @@ class PerfAgent(InteractiveAgent):
             lo, hi = max(1, mid - half), min(len(lines), mid + half)
             excerpt = f" (excerpt: lines {lo}-{hi} of {len(lines)})"
         code = "\n".join(f"{i:6}\t{lines[i - 1]}" for i in range(lo, hi + 1))
-        prompt = render(QUESTION, path=path, excerpt=excerpt, location=location, code=code)
-        record = {"step": self.n_calls, "rebuilds": rebuilds, "path": path, "location": location, "prompt": prompt}
-        self.fresh_looks.append(record)
-        try:
-            answer, cost = self._ask(prompt)
-        except Exception as e:
-            logger.warning("fresh look failed: %r", e)
-            record["error"] = repr(e)
-            return []
-        self.cost += cost
-        record |= {"answer": answer, "cost": cost}
-        content = render(HANDBACK, rebuilds=rebuilds, path=path, location=location, answer=answer.strip())
-        return self.add_messages(
-            self.model.format_message(role="user", content=content, extra={"fresh_look": record})
+        symptom = self._symptom()
+        prompt = render(
+            QUESTION,
+            project=self.config.fresh_look_project,
+            symptom=symptom,
+            path=path,
+            excerpt=excerpt,
+            location=location,
+            code=code,
         )
+        record = {
+            "step": self.n_calls,
+            "trigger": why,
+            "path": path,
+            "location": location,
+            "symptom": symptom,
+            "file": dict(self.files[path]),
+            "prompt": prompt,
+        }
+        self.fresh_looks.append(record)
+        self._start(record)
+
+    def _start(self, record: dict) -> None:
+        """Ask in the background; `_collect` hands the answer back once it is in."""
+        box: dict = {}
+
+        def call():
+            try:
+                box["answer"], box["cost"] = self._ask(record["prompt"])
+            except Exception as e:
+                box["error"] = e
+
+        worker = threading.Thread(target=call, daemon=True)
+        record["_started"] = time.monotonic()
+        worker.start()
+        self._pending.append((record, worker, box))
+
+    def _collect(self) -> list[dict]:
+        messages, waiting = [], []
+        for record, worker, box in self._pending:
+            if worker.is_alive():
+                if time.monotonic() - record["_started"] < self.config.fresh_look_deadline_seconds:
+                    waiting.append((record, worker, box))
+                else:
+                    record["error"] = f"no answer within {self.config.fresh_look_deadline_seconds} s"
+                continue
+            if "error" in box:
+                logger.warning("fresh look failed: %r", box["error"])
+                record["error"] = repr(box["error"])
+                continue
+            self.cost += box["cost"]
+            record |= {"answer": box["answer"], "cost": box["cost"], "answered_step": self.n_calls}
+            reason = REASONS[record["trigger"]].format(path=record["path"], n=record["file"]["visits"])
+            content = render(
+                HANDBACK,
+                reason=reason,
+                path=record["path"],
+                location=record["location"],
+                symptom=record["symptom"],
+                answer=box["answer"].strip(),
+            )
+            messages += self.add_messages(
+                self.model.format_message(role="user", content=content, extra={"fresh_look": record})
+            )
+        self._pending = waiting
+        return messages
 
     def _ask(self, prompt: str) -> tuple[str, float]:
-        """One request to the run's model with no tools and no history. Raises on error or past the deadline."""
+        """One request to the run's model with no tools and no history. Raises on error."""
         url, key = getattr(self.model, "_api_url", None), getattr(self.model, "_api_key", None)
         if not url:
             raise RuntimeError(f"fresh look needs an OpenRouter model, not {type(self.model).__name__}")
@@ -182,35 +322,19 @@ class PerfAgent(InteractiveAgent):
             "usage": {"include": True},
             **self.model.config.model_kwargs,
         }
-        box: dict = {}
-
-        def call():
-            try:
-                r = requests.post(
-                    url,
-                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                    data=json.dumps(payload),
-                    timeout=60,
-                )
-                r.raise_for_status()
-                box["response"] = r.json()
-            except Exception as e:
-                box["error"] = e
-
-        # A daemon thread, so a request past the deadline is abandoned rather than holding up the run.
-        worker = threading.Thread(target=call, daemon=True)
         started = time.monotonic()
-        worker.start()
-        worker.join(self.config.fresh_look_deadline_seconds)
-        if worker.is_alive():
-            raise TimeoutError(f"no answer within {self.config.fresh_look_deadline_seconds} s")
-        if "error" in box:
-            raise box["error"]
-        response = box["response"]
-        answer = response["choices"][0]["message"].get("content") or ""
+        r = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            data=json.dumps(payload),
+            timeout=60,
+        )
+        r.raise_for_status()
+        response = r.json()
         logger.info("fresh look answered in %.0f s", time.monotonic() - started)
-        return answer, response.get("usage", {}).get("cost", 0.0)
+        return response["choices"][0]["message"].get("content") or "", response.get("usage", {}).get("cost", 0.0)
 
     def serialize(self, *extra_dicts) -> dict:
-        digest = {"fresh_looks": [{k: v for k, v in r.items() if k != "prompt"} for r in self.fresh_looks]}
+        looks = [{k: v for k, v in r.items() if k not in ("prompt", "_started")} for r in self.fresh_looks]
+        digest = {"fresh_looks": looks, "files": {path: dict(c) for path, c in self.files.items()}}
         return super().serialize({"info": digest}, *extra_dicts)
