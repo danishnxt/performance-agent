@@ -48,12 +48,15 @@ def build(
     tools_dest: Path | None = None,
     workdir: Path | None = None,
     scratch: Path | None = None,
+    fresh_look: bool = False,
 ) -> dict:
     config = yaml.safe_load((CONFIG_DIR / "mini.yaml").read_text())
     template = config["agent"]["instance_template"]
     start = template.index("## Recommended Workflow")
     end = template.index("## Command Execution Rules")
     middle = raw((PERF_DIR / "workflow.md").read_text())
+    if fresh_look:
+        middle += "## Fresh looks\n\n" + raw((PERF_DIR / "fresh_look.md").read_text())
     if workdir:
         env = f"The repository is your current working directory, `{workdir}`. Every command starts there; do not search the machine for it."
         if scratch:
@@ -87,8 +90,9 @@ def main():
     parser.add_argument("--tools-dest", type=Path)
     parser.add_argument("--workdir", type=Path)
     parser.add_argument("--scratch", type=Path)
+    parser.add_argument("--fresh-look", action="store_true")
     args = parser.parse_args()
-    args.out.write_text(yaml.safe_dump(build(args.guide, args.tools, args.tools_dest, args.workdir, args.scratch), sort_keys=False, allow_unicode=True, width=10_000))
+    args.out.write_text(yaml.safe_dump(build(args.guide, args.tools, args.tools_dest, args.workdir, args.scratch, args.fresh_look), sort_keys=False, allow_unicode=True, width=10_000))
 
 
 if __name__ == "__main__":
