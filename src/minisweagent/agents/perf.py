@@ -1,4 +1,10 @@
-"""Performance agent: the interactive agent plus a fresh look at a file the agent is circling.
+"""Performance agent: the interactive agent plus a fresh look at a file the agent is circling, and fresh-context
+episodes.
+
+Episodes (`episode_steps`): every N steps the agent writes a handoff note, its conversation is cleared, and it carries
+on from the task and that note alone; the repository, build and scratch files stay. Epoch 18 pilots found the first
+~50 steps the sharpest: later the agent re-read its own early conclusions ("this is upstream code") as settled and
+talked itself out of the planted causes. The saved trajectory keeps every episode's messages in order.
 
 A fresh look sends one file to the same model in a separate request: no run history, no profiles and none of the
 agent's theories, only the file, the lines the agent is on, the project and the measured symptom. The answer goes
@@ -75,6 +81,31 @@ This is a lead, not a fact. If it names a cause, test it next: make the smallest
 right, rebuild, measure, and run the correctness checks. Keep it only if the benchmark confirms it. If it says the \
 file is innocent, weigh that against your own evidence before spending more steps here."""
 
+HANDOFF_REQUEST = """Context reset (automatic, every {{ n }} steps). Your conversation is about to be cleared. The \
+repository, its build and your scratch files stay as they are. A fresh session continues from a note you write now and \
+sees nothing else from this conversation.
+
+In this one step, write the note to `$TMPDIR/HANDOFF.md` with a single heredoc command, and do nothing else. In it:
+1. Measurements: the slow workloads against the baseline, first and latest (numbers).
+2. Fixes made: file, function, what changed, before and after numbers, and whether it is kept.
+3. Open suspects: file and function, the measurement or profile line that points there, and the next experiment.
+4. Ruled out: each lead with the measurement that ruled it out. A lead you set aside by reasoning, or because the code \
+looks like the upstream you remember, is not ruled out: list it under open suspects.
+Keep it under 60 lines."""
+
+RESUME = """You are continuing a performance investigation: session {{ k }}. Each session gets {{ n }} steps, then a \
+fresh context. The repository already contains the earlier sessions' changes (`git diff` shows them) and the build \
+reflects them. `$TMPDIR/before`, if it exists, is the tree from before any change: compare against it, never overwrite it.
+
+The note the previous session left:
+
+<handoff>
+{{ note }}
+</handoff>
+
+Its "ruled out" items are settled only where it gives a measurement. Re-measure before relying on its numbers, then \
+carry on from its open suspects."""
+
 REASONS = {
     "visits": "have read `{path}` in {n} steps without changing it",
     "failed": "changed `{path}` and the next perf-compare showed nothing getting faster",
@@ -111,6 +142,8 @@ class PerfAgentConfig(InteractiveAgentConfig):
     """Cap on the whole fresh-look request. OpenRouter keep-alive padding defeats a socket timeout; one hung 17 min."""
     fresh_look_max_lines: int = 2500
     """Larger files are sent as an excerpt around the location of interest."""
+    episode_steps: int = 0
+    """Clear the context every this many steps, carrying over only a handoff note. 0 turns episodes off."""
 
 
 class PerfAgent(InteractiveAgent):
@@ -124,6 +157,18 @@ class PerfAgent(InteractiveAgent):
         self._tracked: set[str] | None = None
         self._baseline: dict[str, float] | None = None
         self._pending: list[tuple[dict, threading.Thread, dict]] = []
+        self.episodes: list[list[dict]] = []
+        self.handoffs: list[dict] = []
+        self._next_reset = self.config.episode_steps
+        self._handing_off = False
+
+    def query(self) -> dict:
+        limit = self.config.step_limit
+        if 0 < self._next_reset <= self.n_calls and not self._handing_off and not 0 < limit <= self.n_calls:
+            self._handing_off = True
+            content = render(HANDOFF_REQUEST, n=self.config.episode_steps)
+            self.add_messages(self.model.format_message(role="user", content=content, extra={"handoff_request": True}))
+        return super().query()
 
     def execute_actions(self, message: dict) -> list[dict]:
         result = super().execute_actions(message)
@@ -132,7 +177,19 @@ class PerfAgent(InteractiveAgent):
             outputs = [m.get("extra", {}).get("raw_output", "") for m in result]
             self._track(commands, outputs)
             result += self._collect()
+        if self._handing_off:
+            self._new_episode()
         return result
+
+    def _new_episode(self) -> None:
+        note = self.env.execute({"command": 'cat "$TMPDIR/HANDOFF.md"'}).get("output", "").strip()
+        self.handoffs.append({"step": self.n_calls, "note": note})
+        self.episodes.append(self.messages)
+        self.messages = self.messages[:2]
+        content = render(RESUME, k=len(self.episodes) + 1, n=self.config.episode_steps, note=note or "(none was written)")
+        self.add_messages(self.model.format_message(role="user", content=content, extra={"episode": len(self.episodes) + 1}))
+        self._next_reset = self.n_calls + self.config.episode_steps
+        self._handing_off = False
 
     # --- what the agent is circling ---
 
@@ -343,5 +400,7 @@ class PerfAgent(InteractiveAgent):
 
     def serialize(self, *extra_dicts) -> dict:
         looks = [{k: v for k, v in r.items() if k not in ("prompt", "_started")} for r in self.fresh_looks]
-        digest = {"fresh_looks": looks, "files": {path: dict(c) for path, c in self.files.items()}}
-        return super().serialize({"info": digest}, *extra_dicts)
+        digest = {"fresh_looks": looks, "files": {path: dict(c) for path, c in self.files.items()}, "handoffs": self.handoffs}
+        data = super().serialize({"info": digest}, *extra_dicts)
+        data["messages"] = [m for episode in self.episodes for m in episode] + self.messages
+        return data

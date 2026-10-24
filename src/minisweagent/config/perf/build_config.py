@@ -7,6 +7,7 @@ Usage: build_config.py OUT.yaml [--guide NAME] [--tools NAME]
   Adds guides/platform/<os>.md for the OS it runs on.
   --tools-dest: copy the tools there and put that copy on PATH, so PATH does not reveal this checkout
   --workdir, --scratch: tell the agent where the repository is and where to put scratch files
+  --episode-steps N: clear the agent's context every N steps, carrying over a handoff note it writes
 """
 
 import argparse
@@ -49,6 +50,7 @@ def build(
     workdir: Path | None = None,
     scratch: Path | None = None,
     fresh_look: bool = False,
+    episode_steps: int = 0,
 ) -> dict:
     config = yaml.safe_load((CONFIG_DIR / "mini.yaml").read_text())
     template = config["agent"]["instance_template"]
@@ -79,6 +81,8 @@ def build(
     config["agent"]["instance_template"] = template[:start] + middle + SUBMIT + template[end:]
     config["agent"]["system_template"] = SYSTEM
     config["agent"]["agent_class"] = "minisweagent.agents.perf.PerfAgent"
+    if episode_steps:
+        config["agent"]["episode_steps"] = episode_steps
     return config
 
 
@@ -91,8 +95,9 @@ def main():
     parser.add_argument("--workdir", type=Path)
     parser.add_argument("--scratch", type=Path)
     parser.add_argument("--fresh-look", action="store_true")
+    parser.add_argument("--episode-steps", type=int, default=0)
     args = parser.parse_args()
-    args.out.write_text(yaml.safe_dump(build(args.guide, args.tools, args.tools_dest, args.workdir, args.scratch, args.fresh_look), sort_keys=False, allow_unicode=True, width=10_000))
+    args.out.write_text(yaml.safe_dump(build(args.guide, args.tools, args.tools_dest, args.workdir, args.scratch, args.fresh_look, args.episode_steps), sort_keys=False, allow_unicode=True, width=10_000))
 
 
 if __name__ == "__main__":
