@@ -24,11 +24,14 @@ perf-sample w21                          # a workload, run over and over while s
 perf-sample -- build/python.exe x.py     # any command
 perf-sample --pid PID                    # a process that is already running
 perf-sample --compare w21 w17            # two workloads: which C functions differ most in share
+perf-sample w21 --callers FUNC           # also: which functions FUNC's time runs under
 ```
 
 It runs the workload once to warm up, then samples the CPU for `--seconds` (default 5) while it runs, and prints the C functions that take the time, ranked by self time (the function's own code) and by inclusive time (including what it calls). Use it when the slow part is in C (a built-in function or method, or a module written in C). Time spent running Python code shows up as the interpreter loop (`_PyEval_EvalFrameDefault`), not as Python function names: use `perf-profile` for those.
 
 `--compare A B` profiles two workloads and lists the functions whose share of CPU time differs most between them. Pick a slow workload and a similar one that is not slow: what the slow one spends more of its time in is where to look.
+
+`--callers FUNC` adds, for one function from the tables, the functions it runs under and the share of its samples under each. A hot leaf such as a dict lookup or `memcpy` is rarely the cause by itself; its callers show which caller makes it run so often. Copy FUNC exactly from the tables.
 
 ### `perf-compare`: is build B faster or slower than build A?
 

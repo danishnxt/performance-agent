@@ -7,6 +7,7 @@ Usage:
   perf-sample --pid PID             a process that is already running
   perf-sample --compare w21 w17     profile two workloads and list the functions whose share of CPU time
                                     differs most between them
+  perf-sample w21 --callers FUNC    also list the functions FUNC runs under, by share of its samples
 
 Options:
   --python PATH   interpreter for workloads (default: build/python.exe)
@@ -168,7 +169,7 @@ def tally(stacks):
     return own, incl, total, len(busy_by_thread), dropped, where, libs
 
 
-def report(stacks, top):
+def report(stacks, top, focus=None):
     own, incl, total, threads, dropped, where, libs = tally(stacks)
     print(f"  {total:,} busy samples across {threads} threads ({dropped} idle threads dropped).")
     print("  self = CPU in the function's own code; incl = own code plus everything it calls. % of busy samples.")
@@ -191,6 +192,29 @@ def report(stacks, top):
             break
     if hidden:
         print(f"  (thread entry frames above {ENTRY_SHARE:.0%} and system-library frames hidden)")
+    if focus:
+        print()
+        callers(stacks, focus, top)
+
+
+def callers(stacks, name, top):
+    """Who FUNC's time is spent under: each function on its call stacks, with the share of FUNC's samples."""
+    under, total = Counter(), 0
+    for _, stack, count in stacks:
+        syms = [s for s, _, _ in stack]
+        if name not in syms or IDLE.match(syms[-1]):
+            continue
+        total += count
+        for s in set(syms[: syms.index(name)]):
+            under[s] += count
+    if not total:
+        die(f"{name} is not in any sampled stack; copy the name exactly from the tables")
+    print(f"Callers of {name} ({total:,} samples with it on the stack):")
+    print("  % of those samples that run under each function; the hot function's own callers say why it runs.")
+    print(f"{'share':>6}  function")
+    rows = [(n, s) for s, n in under.items() if n / total < ENTRY_SHARE]
+    for n, s in sorted(rows, key=lambda r: -r[0])[:top]:
+        print(f"{100 * n / total:>5.1f}%  {short_name(s)}")
 
 
 def compare(a, b, top):
@@ -284,6 +308,7 @@ def main():
     p.add_argument("--top", type=int, default=25)
     p.add_argument("--raw")
     p.add_argument("--compare", nargs=2)
+    p.add_argument("--callers")
     p.add_argument("-h", "--help", action="store_true")
     a = p.parse_args(argv)
     if a.help or not (a.target or a.pid or a.compare or command):
@@ -301,7 +326,7 @@ def main():
         print(f"perf-sample --pid {a.pid}")
         stacks, how = run(a.pid, seconds, raw)
         print(f"  profiler: {how}; sampled {seconds} s of a running process")
-        report(stacks, a.top)
+        report(stacks, a.top, a.callers)
         return
 
     if command:
@@ -314,7 +339,7 @@ def main():
             proc.wait()
         print(f"perf-sample -- {' '.join(command)}")
         print(f"  profiler: {how}; sampled the first {seconds} s (start-up included; the process is stopped after)")
-        report(stacks, a.top)
+        report(stacks, a.top, a.callers)
         return
 
     if not Path(a.python).is_file():
@@ -336,7 +361,7 @@ def main():
     print(f"  profiler: {how}")
     each = f", about {1000 * seconds / runs:.0f} ms each" if runs else "; no run finished inside the window"
     print(f"  warm-up run {warm:.3f} s (not profiled), then {seconds} s sampled while run() ran {runs} times{each}")
-    report(stacks, a.top)
+    report(stacks, a.top, a.callers)
 
 
 if __name__ == "__main__":

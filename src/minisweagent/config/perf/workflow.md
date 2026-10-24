@@ -9,7 +9,7 @@ These rules apply to any codebase. They tell you how to work. A domain guide, if
 3. **Rank the regressions by size and work the worst first.** List the slow workloads by how much slower they are. There may be more than one cause, and a large one can hide a small one. Look at the ones that moved, and at the ones that did not. What do the slow ones do that the fast ones don't?
 4. **Profile the worst workload.** Find the part (function, operator, stage) that takes the most time, or does far more work than it should. If a profiling tool is listed under Tools, use it. After fixing one cause, re-measure and go back to step 3 for the next.
 5. **Find the code responsible.** Name the file and function that decides or does that work.
-6. **State a hypothesis that predicts a number, then test it with an experiment.** For example: "if this is the cause, workload X drops from 500 ms to about 150 ms". Make the smallest code change that would show whether it is right, rebuild, and re-run that workload. Do this within about 10 steps of naming the code. Do not try to work out the answer by hand by tracing formulas or simulating the code; the measurement is faster and settles it. If the number does not move as predicted, revert and drop the hypothesis. But a test only rules a hypothesis out if the number would have moved were the hypothesis true: if the system already corrects for what you changed (for example, it reorders conditions at runtime, so reordering them in the query changes nothing), the test tells you nothing. A hypothesis that no measurement has confirmed after about 15 steps is dropped too: go back to the profile.
+6. **State a hypothesis that predicts a number, then test it with an experiment.** For example: "if this is the cause, workload X drops from 500 ms to about 150 ms". Make the smallest code change that would show whether it is right, rebuild, and re-run that workload. Do this within about 10 steps of naming the code; reading more code does not count as a test. Do not try to work out the answer by hand by tracing formulas or simulating the code; the measurement is faster and settles it. If the number does not move as predicted, revert and drop the hypothesis. But a test only rules a hypothesis out if the number would have moved were the hypothesis true: if the system already corrects for what you changed (for example, it reorders conditions at runtime, so reordering them in the query changes nothing), the test tells you nothing. A hypothesis that no measurement has confirmed after about 15 steps is dropped too: go back to the profile.
 7. **Fix the cause, then re-measure** the slow workloads *and* some unaffected ones. Keep the fix only if the slow ones improve beyond noise and the others do not get worse. If a comparison tool is listed under Tools, use it for this. Otherwise revert it and go back to step 4.
 8. **Report** what you found, what you changed, and the before/after numbers. Claim only what you measured.
 
@@ -22,6 +22,8 @@ Find out early what you can compare against:
 - **Nothing:** judge the profile against what correct behaviour looks like. Does each stage do work proportional to its input? Do estimates match actual sizes? Is work happening that the result does not need? Is a cheaper path available but not taken? The domain guide lists what "correct" looks like.
 
 The absence of history is not evidence that there is no regression. Read the code the profile points to as if it might be wrong.
+
+Code that matches how you remember the upstream project is not cleared by that. Your memory is not evidence, and a regression is often a small difference from what you remember: a removed cache, a missing table entry, a fast path that is gone. Missing code counts: if a hot operation takes a generic path where similar operations have a specialized one, that absence may be the regression. Only a measurement clears a suspect.
 
 ## Code or environment?
 
@@ -39,6 +41,7 @@ The absence of history is not evidence that there is no regression. Read the cod
 
 - Run each measurement several times (5 or more). Drop the first run. Compare medians.
 - When comparing two builds, run them on the same machine, interleaved (A B A B), with the same settings.
+- If the machine's speed drifts during the session, compare each slow workload with unaffected ones measured in the same pass. Their ratio stays valid when all absolute times move; drift does not explain a workload that is slow relative to its neighbours.
 - Small differences are noise. Between two separately compiled builds, expect a few percent of noise in totals and more on single workloads. Do not chase or claim a change smaller than that.
 - Keep long outputs short: save them to a file, then pull out the lines you need. Don't read a huge output through `head` and guess at the rest.
 
