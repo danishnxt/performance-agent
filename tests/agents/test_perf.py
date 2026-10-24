@@ -138,10 +138,19 @@ def test_episodes_clear_the_context_and_carry_the_handoff_note(repo, monkeypatch
     note = "cat > \"$TMPDIR/HANDOFF.md\" <<'X'\nsuspect: src/a.cpp\nX"
     agent = run_agent(repo, ["echo one", "echo two", note, "echo three"], episode_steps=2, fresh_look_visits=0)
     contents = [str(m.get("content", "")) for m in agent.messages]
-    assert len(agent.episodes) == 1 and agent.handoffs == [{"step": 3, "note": "suspect: src/a.cpp"}]
+    assert len(agent.episodes) == 1 and agent.handoffs == [{"step": 3, "asks": 1, "note": "suspect: src/a.cpp"}]
     assert "suspect: src/a.cpp" in contents[2] and "step 0" not in contents and "step 3" in contents
     saved = [str(m.get("content", "")) for m in agent.serialize()["messages"]]
     assert len(saved) == len(agent.episodes[0]) + len(agent.messages) and "step 0" in saved
+
+
+def test_handoff_waits_while_the_agent_reapplies_a_fix(repo, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(repo))
+    note = "cat > \"$TMPDIR/HANDOFF.md\" <<'X'\nKEPT: fix\nX"
+    agent = run_agent(repo, ["echo one", "echo two", "echo reapply", note, "echo four"], episode_steps=2, fresh_look_visits=0)
+    assert agent.handoffs == [{"step": 4, "asks": 2, "note": "KEPT: fix"}]
+    assert sum("Context reset" in str(m.get("content")) for m in agent.episodes[0]) == 2
+
 
 def test_fresh_look_off(repo):
     agent = run_agent(repo, ["cat src/a.cpp", "cat src/a.cpp"], fresh_look_visits=0)

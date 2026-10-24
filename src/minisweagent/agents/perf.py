@@ -85,9 +85,13 @@ HANDOFF_REQUEST = """Context reset (automatic, every {{ n }} steps). Your conver
 repository, its build and your scratch files stay as they are. A fresh session continues from a note you write now and \
 sees nothing else from this conversation.
 
-In this one step, write the note to `$TMPDIR/HANDOFF.md` with a single heredoc command, and do nothing else. In it:
+The tree as you leave it is what the next session starts from. If a change you measured as a fix is not applied and \
+built right now, make that your one command instead: apply it and rebuild (`... && make -C build -j`), and the request \
+comes again next step. Otherwise, in this one step, write the note to `$TMPDIR/HANDOFF.md` with a single heredoc \
+command, and do nothing else. In it:
 1. Measurements: the slow workloads against the baseline, first and latest (numbers).
-2. Fixes made: file, function, what changed, before and after numbers, and whether it is kept.
+2. Fixes: for each, file, function, what changed, before and after numbers, and KEPT (applied and built now) or \
+REVERTED. A fix that measured better than the baseline is KEPT, not "experimental".
 3. Open suspects: file and function, the measurement or profile line that points there, and the next experiment.
 4. Ruled out: each lead with the measurement that ruled it out. A lead you set aside by reasoning, or because the code \
 looks like the upstream you remember, is not ruled out: list it under open suspects.
@@ -106,7 +110,8 @@ The note the previous session left:
 
 Start with the first "next experiment" in its open suspects: make that change, rebuild and measure it now. Do not \
 re-read the code or re-run the suite first; re-measure only what that experiment needs. Its "ruled out" items are \
-settled only where it gives a measurement."""
+settled only where it gives a measurement. Fixes marked KEPT stay: undo one only if a measurement in this session \
+shows it does not help."""
 
 REASONS = {
     "visits": "have read `{path}` in {n} steps without changing it",
@@ -162,12 +167,12 @@ class PerfAgent(InteractiveAgent):
         self.episodes: list[list[dict]] = []
         self.handoffs: list[dict] = []
         self._next_reset = self.config.episode_steps
-        self._handing_off = False
+        self._handoff_asks = 0
 
     def query(self) -> dict:
         limit = self.config.step_limit
-        if 0 < self._next_reset <= self.n_calls and not self._handing_off and not 0 < limit <= self.n_calls:
-            self._handing_off = True
+        if 0 < self._next_reset <= self.n_calls and not 0 < limit <= self.n_calls:
+            self._handoff_asks += 1
             content = render(HANDOFF_REQUEST, n=self.config.episode_steps)
             self.add_messages(self.model.format_message(role="user", content=content, extra={"handoff_request": True}))
         return super().query()
@@ -179,19 +184,21 @@ class PerfAgent(InteractiveAgent):
             outputs = [m.get("extra", {}).get("raw_output", "") for m in result]
             self._track(commands, outputs)
             result += self._collect()
-        if self._handing_off:
+        # The agent may first re-apply a fix it measured (the request asks it to); reset once the note is written.
+        commands = [action.get("command", "") for action in message.get("extra", {}).get("actions", [])]
+        if self._handoff_asks and (any("HANDOFF.md" in c for c in commands) or self._handoff_asks >= 3):
             self._new_episode()
         return result
 
     def _new_episode(self) -> None:
         note = self.env.execute({"command": 'cat "$TMPDIR/HANDOFF.md"'}).get("output", "").strip()
-        self.handoffs.append({"step": self.n_calls, "note": note})
+        self.handoffs.append({"step": self.n_calls, "asks": self._handoff_asks, "note": note})
         self.episodes.append(self.messages)
         self.messages = self.messages[:2]
         content = render(RESUME, k=len(self.episodes) + 1, n=self.config.episode_steps, note=note or "(none was written)")
         self.add_messages(self.model.format_message(role="user", content=content, extra={"episode": len(self.episodes) + 1}))
         self._next_reset = self.n_calls + self.config.episode_steps
-        self._handing_off = False
+        self._handoff_asks = 0
 
     # --- what the agent is circling ---
 
