@@ -27,5 +27,11 @@ class SandboxedLocalEnvironment(LocalEnvironment):
     def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
         merged = os.environ | self.config.env
         keep = " ".join(shlex.quote(f"{k}={merged[k]}") for k in self.config.keep_env if k in merged)
-        command = f"/usr/bin/env -i {keep} /usr/bin/sandbox-exec -f {shlex.quote(self.config.profile)} /bin/sh -c {shlex.quote(action.get('command', ''))}"
-        return super().execute({**action, "command": command}, cwd, timeout=timeout)
+        original = action.get("command", "")
+        command = f"/usr/bin/env -i {keep} /usr/bin/sandbox-exec -f {shlex.quote(self.config.profile)} /bin/sh -c {shlex.quote(original)}"
+        output = super().execute({**action, "command": command}, cwd, timeout=timeout)
+        # Errors (e.g. a timeout) quote the wrapped command, whose profile path names the experiment's folders.
+        for d, key in ((output, "exception_info"), (output.get("extra", {}), "exception")):
+            if d.get(key):
+                d[key] = d[key].replace(command, original)
+        return output
