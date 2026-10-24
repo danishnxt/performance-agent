@@ -2,7 +2,7 @@
 """Python-level profile of one workload or script: which Python and built-in functions the time goes to.
 
 Usage:
-  perf-profile w05                  a workload from benchmarks/workloads/
+  perf-profile w21                  a workload from benchmarks/workloads/
   perf-profile SCRIPT.py [ARGS]     any script (runs it once, profiled)
 
 Options:

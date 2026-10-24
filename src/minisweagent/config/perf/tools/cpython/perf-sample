@@ -2,10 +2,10 @@
 """CPU profile of CPython while it runs a workload or a command: which C functions the CPU time goes to.
 
 Usage:
-  perf-sample w05                   a workload from benchmarks/workloads/, run over and over
+  perf-sample w21                   a workload from benchmarks/workloads/, run over and over
   perf-sample -- CMD [ARGS]         any command, e.g. perf-sample -- build/python.exe script.py
   perf-sample --pid PID             a process that is already running
-  perf-sample --compare w05 w16     profile two workloads and list the functions whose share of CPU time
+  perf-sample --compare w21 w17     profile two workloads and list the functions whose share of CPU time
                                     differs most between them
 
 Options:

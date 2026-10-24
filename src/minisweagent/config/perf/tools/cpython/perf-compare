@@ -3,7 +3,7 @@
 
 Usage:
   perf-compare A B                  e.g. perf-compare $TMPDIR/before/build/python.exe build/python.exe
-  perf-compare A B w05 w13          only these workloads (default: every benchmarks/workloads/w*.py)
+  perf-compare A B w21 w29          only these workloads (default: every benchmarks/workloads/w*.py)
 
 Options:
   --rounds N      rounds of both interpreters (default 5); the first round is a warm-up and is dropped

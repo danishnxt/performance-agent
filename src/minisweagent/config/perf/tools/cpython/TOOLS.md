@@ -11,7 +11,7 @@ cp -cR . $TMPDIR/before                  # copy-on-write clone of the tree and i
 ### `perf-profile`: Python-level profile of one workload
 
 ```
-perf-profile w05                         # a workload from benchmarks/workloads/
+perf-profile w21                         # a workload from benchmarks/workloads/
 perf-profile script.py                   # any script
 ```
 
@@ -20,10 +20,10 @@ It profiles with cProfile inside `build/python.exe` and prints the functions by 
 ### `perf-sample`: CPU profile of the interpreter's C code
 
 ```
-perf-sample w05                          # a workload, run over and over while sampling
+perf-sample w21                          # a workload, run over and over while sampling
 perf-sample -- build/python.exe x.py     # any command
 perf-sample --pid PID                    # a process that is already running
-perf-sample --compare w05 w16            # two workloads: which C functions differ most in share
+perf-sample --compare w21 w17            # two workloads: which C functions differ most in share
 ```
 
 It runs the workload once to warm up, then samples the CPU for `--seconds` (default 5) while it runs, and prints the C functions that take the time, ranked by self time (the function's own code) and by inclusive time (including what it calls). Use it when the slow part is in C (a built-in function or method, or a module written in C). Time spent running Python code shows up as the interpreter loop (`_PyEval_EvalFrameDefault`), not as Python function names: use `perf-profile` for those.
@@ -34,7 +34,7 @@ It runs the workload once to warm up, then samples the CPU for `--seconds` (defa
 
 ```
 perf-compare $TMPDIR/before/build/python.exe build/python.exe            # every workload
-perf-compare $TMPDIR/before/build/python.exe build/python.exe w05 w13    # only these
+perf-compare $TMPDIR/before/build/python.exe build/python.exe w21 w29    # only these
 ```
 
 It runs the two interpreters alternately over the workloads and prints, per workload, the median time of each and a verdict: faster, SLOWER, or "no change beyond noise" (5% per workload, 2% for the suite total). Use it to decide whether to keep a change. All workloads take about a minute; name a few to go faster.
