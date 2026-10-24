@@ -95,7 +95,8 @@ Keep it under 60 lines."""
 
 RESUME = """You are continuing a performance investigation: session {{ k }}. Each session gets {{ n }} steps, then a \
 fresh context. The repository already contains the earlier sessions' changes (`git diff` shows them) and the build \
-reflects them. `$TMPDIR/before`, if it exists, is the tree from before any change: compare against it, never overwrite it.
+reflects them. `$TMPDIR/before`, if it exists, is the tree from before any change: keep it as the build to compare \
+every fix against (`perf-compare $TMPDIR/before/build/python.exe build/python.exe`), and never overwrite it.
 
 The note the previous session left:
 
@@ -103,8 +104,9 @@ The note the previous session left:
 {{ note }}
 </handoff>
 
-Its "ruled out" items are settled only where it gives a measurement. Re-measure before relying on its numbers, then \
-carry on from its open suspects."""
+Start with the first "next experiment" in its open suspects: make that change, rebuild and measure it now. Do not \
+re-read the code or re-run the suite first; re-measure only what that experiment needs. Its "ruled out" items are \
+settled only where it gives a measurement."""
 
 REASONS = {
     "visits": "have read `{path}` in {n} steps without changing it",
