@@ -83,7 +83,6 @@ nav:
       - "Environments": advanced/environments.md
       - "v2 migration guide": advanced/v2_migration.md
     - "FAQ": faq.md
-    - "Contributing": contributing.md
   - API Reference:
     - "reference/index.md"
     - Agents:

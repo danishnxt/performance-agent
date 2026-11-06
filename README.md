@@ -6,26 +6,43 @@ It is a fork of [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent). T
 
 ## Results so far
 
-We test it by planting known slowdowns in real software, then checking whether the agent finds and fixes them. Every run below uses the same cheap model, `deepseek-v4.1-flash`, with a $3 and 200-step cap. "Plain" is stock mini-swe-agent with the same model.
+We test it by planting known slowdowns in real software, then checking whether the agent finds and fixes them. Every run uses the same cheap model, `deepseek-v4.1-flash`, with a $3 and 200-step cap. "Plain" is stock mini-swe-agent with the same model. Each final patch is graded by us, not the agent: rebuilt from a clean copy, timed against an unplanted build in interleaved rounds, and run through the project's tests.
 
-![Bugs fixed per run, plain mini-swe-agent vs performance-agent](docs/perf/bugs-fixed.png)
+### DuckDB: all 3 bugs fixed in every run
 
-| Target | Planted bugs | Plain mini-swe-agent | performance-agent |
-|---|---|---|---|
-| **DuckDB** (C++ database, TPC-H SF10) | 3 | 2, 2, 0 of 3; all 3 runs hit the step cap | **3 of 3 in every run**; finished on its own |
-| **CPython** (C interpreter, 32 workloads) | 5 | 2 of 5 (1 run) | 2, 3, 3 of 5 |
+DuckDB is a C++ analytical database. We planted 3 slowdowns and measured them on the TPC-H benchmark (SF10).
 
-- **Cheap.** A full DuckDB run that fixed all 3 bugs cost $0.18 and took about an hour.
-- **It solves the bug a profiler can't point at.** Two of the DuckDB bugs show up in a profile as one hot function, and plain runs fix those too. The third is a bad runtime decision whose cost lands elsewhere. Only performance-agent fixed it: 6 of 7 runs on an older harness, and all 3 on the current one.
-- **Its fixes match the real ones.** On the current harness, every DuckDB fix restored the original upstream code exactly. On CPython, its fix for the float bug is line for line the fix CPython shipped upstream.
-- **Grading is independent.** Each final patch is rebuilt from a clean copy and timed against an unplanted build, in interleaved rounds, plus the project's tests. The agent's own claims don't count.
-- **Small samples.** 1 to 3 runs per setup on the newest harness. An earlier test showed the same model and prompt scoring 0 of 4 and 4 of 4 on two runs, so these are early results, not benchmark numbers.
+![DuckDB: bugs fixed per run, plain mini-swe-agent vs performance-agent](docs/perf/bugs-fixed-duckdb.png)
 
-### How fast each DuckDB run got there
+| | Plain mini-swe-agent | performance-agent |
+|---|---|---|
+| Bugs fixed (of 3) | 2, 2, 0 | **3, 3, 3** |
+| How runs ended | all 3 hit the 200-step cap | submitted on their own |
+| Benchmark suite after the patch | 7% slower than unplanted | back to unplanted speed |
+
+- **Cheap.** A full run that fixed all 3 bugs cost $0.18 and took about an hour.
+- **It solves the bug a profiler can't point at.** Two of the bugs show up in a profile as one hot function, and plain runs fix those too. The third is a bad runtime decision whose cost lands elsewhere. Only performance-agent fixed it: 6 of 7 runs on an older harness, and all 3 on the current one.
+- **Its fixes match the real ones.** In the run we checked byte for byte, every fix restored the original upstream code exactly.
 
 ![Cumulative confirmed DuckDB fixes by agent step](docs/perf/duckdb-fix-progress.png)
 
 Each line is one run, stepping up when a fix that survived to the final patch was made. performance-agent runs (blue, green) fixed the first bug by step 17 to 31; plain runs (red) took 78 to 108 steps. The green run has the "fresh look" feature turned off; it was the fastest, so that feature is now off by default. A domain guide for databases (yellow) did not help.
+
+### CPython: a harder target, 3 of 5 at best
+
+CPython is the C interpreter behind Python. We undid 4 real upstream performance fixes and added 1 synthetic bug, measured with 32 workloads. It is a harder test: some slowdowns are only 7-10%, and fixing one can shrink another.
+
+![CPython: bugs fixed per run, plain mini-swe-agent vs performance-agent](docs/perf/bugs-fixed-cpython.png)
+
+| | Plain mini-swe-agent | performance-agent |
+|---|---|---|
+| Bugs fixed (of 5) | 2 (1 run) | 2, 3, 3 |
+
+- **Every run fixed the two largest bugs.** The difference is the third: only performance-agent found the synthetic bug (a string hash that is no longer cached), using `perf-sample --callers` to see which function a hot memory copy came from.
+- **Its float fix is line for line the fix CPython shipped upstream.**
+- **The two misses taught us something.** On one, the agent found the cause three times and dismissed it each time because another copy of the code looked the same; the workflow now says that clears nothing. The other is too small to see once a larger bug is fixed, which is a problem with the target.
+
+**Small samples.** 1 to 3 runs per setup. An earlier test showed the same model and prompt scoring 0 of 4 and 4 of 4 on two runs, so these are early results, not benchmark numbers.
 
 ## How it works
 
