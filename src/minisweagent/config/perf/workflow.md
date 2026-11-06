@@ -25,6 +25,8 @@ The absence of history is not evidence that there is no regression. Read the cod
 
 Code that matches how you remember the upstream project is not cleared by that. Your memory is not evidence, and a regression is often a small difference from what you remember: a removed cache, a missing table entry, a fast path that is gone. Missing code counts: if a hot operation takes a generic path where similar operations have a specialized one, that absence may be the regression. Only a measurement clears a suspect.
 
+The same goes for any other copy of the code. "It is the same in my `before` copy", "the installed Python does it too", "the counts match upstream": none of these clears a suspect. Your `before` copy was taken from the code you are investigating, so it has the same regressions; other installs and versions can have them too. A hot spot that looks the same somewhere else is still a hot spot. Clear it only by measuring that it costs what the work needs, or by trying a cheaper version and finding no gain.
+
 ## Code or environment?
 
 | Signal | Points to code | Points to environment |
